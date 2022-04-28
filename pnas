@@ -1,0 +1,569 @@
+#michael.s.denney@gmail.com
+##########################################################
+# pnasrpt
+# nas provision for a srdb record
+#Michael.S.Denney@gmail.com
+my $VERSION=1.10;
+##########################################################
+#TO DO:
+#       multiple tabs for excel spreadsheet
+#Version history
+#  1.01 added --comp
+#  1.10 many enhancments
+##########################################################
+use strict;
+use Data::Dumper;
+use Getopt::Long;
+use Time::Local;
+use Env;
+use DBI;
+use File::Copy;
+use Rpt;
+use Common;
+use Netapp;
+#######ARGV command line variables get opts###################
+use vars qw($verbose $debug $srdb_num @comps $print_sql);
+use vars qw ($silent %issues %template $template $initials);
+use vars qw ($dry);
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path=$base."log";
+my $log_file=$log_path."/$script.log";
+my $err_log=$log_path."/$script.err_log";
+exit unless GetOptions(
+          's|srdb=i' => \$srdb_num,
+          'silent' => \$silent,
+          'i|initials=s' => \$initials,
+          'v' => \$verbose,
+          'd' => \$debug,
+          'template' => \$template,
+          'sql' => \$print_sql,
+          'dry|dry_run' => \$dry,
+          'c|comp=s' => \@comps
+);
+##################Global VARS#################################
+use vars qw(@rpt @error_rpt @mail_rpt @rpt_headers $mail_to);
+use vars qw(@html_files %good_results);
+use vars qw (%formats %arrays @email_rpt $nexus @pscopes);
+#rpt_file,lob_file and excel_file are the tmp files created
+my $excel_file="/tmp/pnasrpt.xls";
+##################Predeclare SUBS#############################
+use subs qw(map_Additional_Comp_Info select_query sanity_check_ndmp_mount);
+use subs qw(from_query where_query order_query load_template);
+use subs qw(usage comp_sanity_chk handle_issues);
+use subs qw(map_lun_security map_luns_carved map_zone_request);
+use subs qw(sanitize_ndmp_map sanity_chk_ndmp_map make_pscope);
+use subs qw(make_nfs_exports_file display_results);
+##############SANITY CHECKS AND PREPS#########################
+$ENV{LIBRARY_PATH}='/usr/local/lib';
+##############################################################
+usage unless (($srdb_num and $initials) or ($template));
+load_template;
+my %initials=read_config("$base/etc/initials.conf");
+%initials= map { lc $_ => $initials{$_} } keys %initials;
+my $srdb_dir="$base/var/srdb/$srdb_num";
+#say "srdb_dir=>$srdb_dir";exit;
+my $netapp=Netapp->new;
+$verbose=1 if ($debug);
+###########################################################################
+$Netapp::srdb_comp="$srdb_num.0";
+unless ($initials{$initials}){
+  slogit "ERROR intials \"$initials\" not in initials.conf";
+  exit 1;
+}
+$mail_to=$initials{$initials} unless ($mail_to);
+slogit "INFO Searching srdb for $srdb_num" unless (@comps);
+slogit "INFO Searching srdb for $srdb_num comps: @comps" if (@comps);
+my $data_source='ODBC:SRDB';
+my $username='TechwebRead';
+my $auth='techweb1read';
+
+my $dbh = DBI->connect('dbi:ODBC:SRDB',$username,$auth,{ RaiseError => 1, AutoCommit => 0 });
+unless ($dbh){
+  print "Failed to connect\n";
+  exit 1;
+}
+
+my $select_query=select_query;
+my $from_query=from_query;
+my $where_query=where_query;
+my $order_query=order_query;
+my $query=$select_query.$from_query.$where_query.$order_query;
+if ($print_sql) {
+    say $query;
+    exit;
+}
+
+my $sth = $dbh->prepare($query);
+$sth->{LongReadLen}=4048;
+my $rv = $sth->execute;
+unless ($rv) {
+  print ERROR with sql-> $dbh->errstr."\n";
+  exit 1;
+}
+
+ while (my $ref = $sth->fetchrow_hashref) {
+   #next unless ($$ref{Comp}==18);
+   #foreach (keys %$ref){
+      #print "$_=>$$ref{$_}\n" 
+   #}
+   #unless ($ref->{'Additional_Comp_Info'}){
+       #print $ref->{'SRDB.Comp'}."\n";
+       #say "EXIT";exit;
+   #}
+   #my $add_info=map_Additional_Comp_Info($$ref{'Additional_Comp_Info'});
+   say "#########Considering $$ref{SRDB}.$$ref{Comp}#########";
+   $Netapp::srdb_comp="$srdb_num.$$ref{Comp}";
+   comp_sanity_chk($ref);
+   sanity_check_ndmp_mount($ref);
+   my $ndmp_map=map_ndmp_mount($$ref{NAS_NDMP_Mount_Points});
+   $ndmp_map=sanitize_ndmp_map($ref,$ndmp_map);
+   sanity_chk_ndmp_map($$ref{Comp},$ndmp_map) unless ($issues{$$ref{Comp}});
+   my $pscope_cmd=make_pscope($ref,$ndmp_map) unless ($issues{$$ref{Comp}});
+   push @pscopes,$pscope_cmd if $pscope_cmd;
+ }#end while my $ref = $sth->fetchrow_hashref
+if ($sth->rows == 0) {
+   slogit "ERROR No comps found where Growth_Type=Growth or Growth_Type=Optimization and Comp_Status=Capacity_Reserved for $srdb_num" 
+}
+
+
+$sth->finish;
+$dbh->rollback;
+$dbh->disconnect;
+
+#print Dumper(@pscopes);
+#print "line->$_\n" foreach (@pscopes);
+foreach my $pscope (@pscopes){
+   my ($stdout,$stderr)=run_cmd($pscope);
+   if (@$stderr){
+      print "ERROR->$_\n" foreach (@$stderr);
+   }
+   my $vol_cmd;my $qtree_cmd;
+   foreach (@$stdout){
+      print "$_\n" ;
+      if (/SCOPE\s+OF\s+comp\s+(\S+)\s+for\s+(\d+)GB\s+useable,(\d+)/){
+          #say "SCOPE HIT $1 -> $2 -> $3";
+          $good_results{$1}{Useable}=$2;
+          $good_results{$1}{Actual}=$3;
+      }
+      $vol_cmd=$1 if (/^INFO\s+Vol\s+create->\s+(.+)/);
+      $qtree_cmd=$1 if (/^INFO\s+Qtree\s+create->\s+(.+)/);
+      $qtree_cmd.=" --alt";
+   }
+   #say "RUN=>$vol_cmd" if $vol_cmd;
+   #say "RUN=>$qtree_cmd" if $qtree_cmd;
+   next if $dry;
+   ($stdout,$stderr)=run_cmd($vol_cmd);
+   say "ERROR_OUT=>$_" foreach (@$stderr);
+   say $_ foreach (@$stdout);
+
+   ($stdout,$stderr)=run_cmd($qtree_cmd);
+   say "ERROR_OUT=>$_" foreach (@$stderr);
+   foreach (@$stdout){
+      if (/^DISPLAY\s+(\S+)\s+(\S+\s+\S+)=(.+)/){
+         #say "DISPLAY HIT";
+         push @{$good_results{$1}{$2}},$3;
+      } else { say $_; }
+   }
+}
+display_results if (%good_results);;
+handle_issues;
+#exit;
+###########################################################################
+sub display_results{
+###########################################################################
+#say "Mailing to $mail_to";
+my $rpt_object=Rpt->new;
+$rpt_object->email_to($mail_to);
+$rpt_object->email_from('Provision_NAS');
+$rpt_object->email_subject("Srdb $srdb_num NAS provision report");
+my @order=(
+           'ZONING REQUEST',
+           'LUNS CARVED',
+           'LUNS SECURITY'
+          ); 
+   foreach (sort {$a<=>$b} keys %good_results){
+       $rpt_object->email("#############################################################\n\r<BR>");
+       $rpt_object->email("############  Provisoned $_ Useable=$good_results{$_}{Useable} Actual=$good_results{$_}{Actual} GB\n\r<BR>");
+       $rpt_object->email("#############################################################\n\r<BR>");
+       foreach my $inner (@order){
+          if ($good_results{$_}{$inner}){
+       $rpt_object->email("#############################################################\n\r<BR>");
+             $rpt_object->email("###########  Comp $_ $inner\n\r<BR>");
+       $rpt_object->email("#############################################################\n\r<BR>");
+             foreach my $line (@{$good_results{$_}{$inner}}){
+                $rpt_object->email("$line\n\r<BR>");
+             }
+             #$rpt_object->email("$good_results{$_}{$inner}\n\r<BR>");
+             #say "$_ $inner $good_results{$_}{$inner}";
+          }
+       }
+   }
+   $rpt_object->SendEmail;
+}
+###########################################################################
+sub make_nfs_exports_file{
+###########################################################################
+  my $file_name=shift;
+  my $exports=shift;
+  my $ref=shift;
+  $file_name.="_exports.$$ref{SRDB}".".$$ref{Comp}";
+  $file_name="/root/provision/bin/$file_name";
+  my @exports=split /,/,$exports;
+  open FH,">$file_name" or die "Unable to create/open $file_name:$!\n";
+  print FH "$_\n" foreach (@exports);
+  close FH;
+  return $file_name;
+}
+###########################################################################
+sub make_pscope{
+###########################################################################
+   my $ref=shift;
+   my $ndmp_map=shift;
+   my $pscope;
+   $pscope='/root/provision/bin/pscope';
+   $pscope.=" --comp $$ref{SRDB}".".$$ref{Comp}";
+   $pscope.=" --filer  $$ref{Disk_Subsystem_Name}";
+   $pscope.=" --ait $$ref{AIT_Number}";
+   $pscope.=" --data $$ndmp_map{data}";
+   $pscope.=" --environ $$ndmp_map{environ}";
+   $pscope.=" --gb $$ndmp_map{gb}";
+   $pscope.=" --snap $$ndmp_map{snap}";
+   $pscope.=" -i $initials";
+   $pscope.=" --nfs_rw $$ndmp_map{nfs_rw}" if ($$ndmp_map{nfs_rw});
+   $pscope.=" --nfs_ro $$ndmp_map{nfs_ro}" if ($$ndmp_map{nfs_ro});
+   $pscope.=" --nfs_root $$ndmp_map{nfs_root}" if ($$ndmp_map{nfs_root});
+   $pscope.=" --nfs_rw_file $$ndmp_map{nfs_rw_file}" if ($$ndmp_map{nfs_rw_file});
+   $pscope.=" --nfs_ro_file $$ndmp_map{nfs_ro_file}" if ($$ndmp_map{nfs_ro_file});
+   $pscope.=" --nfs_root_file $$ndmp_map{nfs_root_file}" if ($$ndmp_map{nfs_root_file});
+   $pscope.=" --uid $$ndmp_map{uid}" if ($$ndmp_map{uid});
+   $pscope.=" --gid $$ndmp_map{gid}" if ($$ndmp_map{gid});
+   $pscope.=" --cifs_share $$ndmp_map{cifs_share}" if ($$ndmp_map{cifs_share});
+   $pscope.=" --cifs_change \'$$ndmp_map{cifs_change}\'" if ($$ndmp_map{cifs_change});
+   $pscope.=" --cifs_read \'$$ndmp_map{cifs_read}\'" if ($$ndmp_map{cifs_read});
+   $pscope.=" --daily 0" if ($$ndmp_map{snap_schedule}=~/^no/i);
+   return $pscope;
+}
+###########################################################################
+sub handle_issues{
+###########################################################################
+   say "################## ISSUES ###########################" if %issues;
+   foreach my $comp (sort {$a<=>$b} keys %issues){
+     say "Comp $comp $_" foreach (@{$issues{$comp}});
+   }
+}
+###########################################################################
+sub comp_sanity_chk{
+###########################################################################
+   my $ref=shift;
+   unless ($$ref{Disk_Subsystem_Name}){
+      slogit "ERROR comp $$ref{Comp} Disk Subsystem Name missing";
+      push @{$issues{$$ref{Comp}}},"Disk Subsystem Name missing";
+   }
+   unless ($$ref{AIT_Number}){
+      slogit "ERROR comp $$ref{Comp} AIT Number missing";
+      push @{$issues{$$ref{Comp}}},"AIT Number missing";
+   }
+   unless ($$ref{Disk_Product}){
+      slogit "ERROR comp $$ref{Comp} Disk Product missing";
+      push @{$issues{$$ref{Comp}}},"Disk Product missing";
+   }
+   my %products=(
+                 'Network Attached' => 1,
+                 'Network Attached-RDS' => 1,
+                 'Network Attached-RDT' => 1,
+                 'NAS-WIP-RDS' => 1,
+                 'NAS-WIP-RDT' => 1
+   );
+   unless ($products{$$ref{Disk_Product}}){
+      slogit "ERROR comp $$ref{Comp} Disk Product not NAS type";
+      push @{$issues{$$ref{Comp}}},"Disk Product not NAS type";
+   }
+}
+###########################################################################
+sub load_template{
+###########################################################################
+#The values of the template hash are the order of items,starting 1
+%template=(
+                  type=>1,
+                  gb=>2,
+                  data=>3,
+                  environ=>4,
+                  snap=>5,
+                  snap_schedule=>6,
+                  snap_mirror_source=>7,
+                  snap_mirror_destination=>8,
+                  cifs_share=>9,
+                  cifs_read=>10,
+                  cifs_change=>11,
+                  nfs_rw=>12,
+                  nfs_ro=>13,
+                  nfs_root=>14,
+                  uid=>15,
+                  gid=>16,
+                  mount_point=>17
+                  );
+#say "$_ $template{$_}" foreach (keys %template);
+#say "template type $template{type} \n";
+   if ($template){
+                  say "type=";
+                  say "gb=";
+                  say "data=";
+                  say "environ=";
+                  say "snap=";
+                  say "snap_schedule=";
+                  say "snap_mirror_source=";
+                  say "snap_mirror_destination=";
+                  say "cifs_share=";
+                  say "cifs_read=";
+                  say "cifs_change=";
+                  say "nfs_rw=";
+                  say "nfs_ro=";
+                  say "nfs_root=";
+                  say "uid=";
+                  say "gid=";
+                  say "mount_point=";
+        exit;
+   }#end if $template
+}
+###########################################################################
+sub sanity_check_ndmp_mount{
+###########################################################################
+   my $ref=shift;
+   my $mount_input=$$ref{NAS_NDMP_Mount_Points};
+ 
+   my @lines=split /[\n|\r]+/,$mount_input;
+   chomp @lines;
+   my $cnt=1; my $template_size=keys %template;
+   foreach (@lines){
+      #chomp $_;
+      #say "LINE $_";
+      my ($label,$value)=split /=/,$_;
+      #next unless ($value);
+      #print "label $label " if $label;
+      #print "value $value " if $value;
+      #print "cnt $cnt" if $cnt;
+      #print "\n" if ($label or $value or $cnt);
+      if ($template{$label} and $template{$label} == $cnt){
+      #say "template=$template{$label}" if ($template{$label});
+         $cnt++;
+         #print " COUNTED\n"
+      } #else { say " NOT COUNTED"};
+
+   }#end foreach @lines
+   #say "Final cnt $cnt"; say "template_size $template_size";
+   if ($cnt-1 ne $template_size){
+      push @{$issues{$$ref{Comp}}},"Error detected in order of template or missing template elements";
+   }
+}
+###########################################################################
+sub sanity_chk_ndmp_map{
+###########################################################################
+   my $comp=shift;
+   my $ndmp_map=shift;
+   #foreach (keys %$ndmp_map){
+       #say "$_=>$$ndmp_map{$_}";
+   #}
+   unless ($$ndmp_map{type}){
+      push @{$issues{$comp}},"type= must be new or growth";
+   } else {
+       unless ($$ndmp_map{type}=~ /(^growth)|(^new)$/i ){
+          push @{$issues{$comp}},"type= must be new or growth";
+       }
+   }
+   unless ($$ndmp_map{gb}){
+      push @{$issues{$comp}},"gb = must be integer";
+   } else {
+       unless ($$ndmp_map{gb}=~ /^\d+$/ ){
+          push @{$issues{$comp}},"type= must be integer";
+       }
+   }
+   unless ($$ndmp_map{data}){
+      push @{$issues{$comp}},"data= must be D,DB,H,G or B.";
+   } else {
+       unless ($$ndmp_map{data}=~ /(^D$)|(^DB$)|(^H$)|(^G$)|(^B$)$/i ){
+          push @{$issues{$comp}},"data= must be D,DB,H,G or B.";
+       }
+   }
+   unless ($$ndmp_map{environ}){
+      push @{$issues{$comp}},"environ= must be UAT,DEV,PRD,PPD,SIT or DR";
+   } else {
+       unless ($$ndmp_map{environ}=~ /(^UAT$)|(^DEV$)|(^PRD$)|(^PPD$)|(^SIT$)|(^DR$)$/i ){
+          push @{$issues{$comp}},"environ= must be UAT,DEV,PRD,PPD,SIT or DR";
+       }
+   }
+   unless ($$ndmp_map{snap}){
+      push @{$issues{$comp}},"snap= must be integer";
+   } else {
+       unless ($$ndmp_map{snap}=~ /^\d+$/ ){
+          push @{$issues{$comp}},"snap= must be integer";
+       }
+   }
+   if (($$ndmp_map{nfs_rw})and(! $$ndmp_map{nfs_root})){
+       unless ($$ndmp_map{uid}){
+          push @{$issues{$comp}},"uid= must be integer";
+       } else {
+          unless ($$ndmp_map{uid}=~ /^\d+$/ ){
+             push @{$issues{$comp}},"uid= must be integer";
+          }
+       }
+       unless ($$ndmp_map{gid}){
+          push @{$issues{$comp}},"gid= must be integer";
+       } else {
+          unless ($$ndmp_map{gid}=~ /^\d+$/ ){
+             push @{$issues{$comp}},"gid= must be integer";
+          }
+       }
+   }#if
+   if ($$ndmp_map{cifs_share}){
+      unless (($$ndmp_map{cifs_change})or($$ndmp_map{cifs_read})){
+         push @{$issues{$comp}},"Because cifs_share= specified, cifs_change= or cifs_read= must be specified";
+      }
+   }#if
+}
+###########################################################################
+sub sanitize_ndmp_map{
+###########################################################################
+   my $ref=shift;
+   my $ndmp_map=shift;
+   foreach (keys %$ndmp_map){
+       unless (/^nfs_rw$/ or /^nfs_ro$/ or /^nfs_root$/ or /^cifs_read$/ or /^cifs_change$/ or /^snap_schedule$/){
+          $$ndmp_map{$_}=~s/\s+//g;#remove all white space
+       }
+       if (/^nfs_rw$/ or /^nfs_ro$/ or /^nfs_root$/ or /^cifs_read$/ or /^cifs_change$/){
+          $$ndmp_map{$_}=~s/[\,|:]+/ /g; #replace : or , with space
+          $$ndmp_map{$_}=~s/\s+/ /g;#take white space down to 1 char
+          $$ndmp_map{$_}=~s/\s/,/g;#replace space with ,
+          $$ndmp_map{$_}=~s/\,$//g;#remove end comma
+          if (/^nfs_rw$/ or /^nfs_ro$/ or /^nfs_root$/){
+             my $count = ( $$ndmp_map{$_} =~ tr/,//);
+             if ($count > 9 ){
+                #say "comma count $count";
+                my $file_name=make_nfs_exports_file($_,$$ndmp_map{$_},$ref);
+                #say "file_name=>$file_name";
+                $$ndmp_map{$_."_file"}=$file_name;
+                undef $$ndmp_map{$_};
+             }
+          }
+       }
+       #say "$_=>$$ndmp_map{$_}";
+   }#end foreach 
+   #say "$$ndmp_map{nfs_rw}";exit;
+   return $ndmp_map;
+}
+###########################################################################
+sub map_ndmp_mount{
+###########################################################################
+   my $mount_input=shift;
+   my %ndmp_map;
+   #print "$mount_input\n";
+   my @lines=split /[\n|\r]+/,$mount_input;
+   chomp @lines;
+   my $prev_label;
+   foreach (@lines){
+      #chomp $_;
+      #say "line=>$_";
+      my ($label,$value)=split /=/,$_;
+      #print "label $label " if $label;
+      #print "value $value " if $value;
+      #print "prev_label $prev_label " if $prev_label;
+      #print "template-label $template{$label} " if ($template{$label});
+      #print "\n";
+      $prev_label=$label if ($template{$label});
+      if ( ! $template{$label} and  ! defined $value ){
+         $ndmp_map{$prev_label}.=" $label";
+      }
+      if ($template{$label} and $value){
+         $ndmp_map{$label}=$value;
+      }
+   }#foreach @lines
+   #say $_ foreach (keys %ndmp_map);
+   return \%ndmp_map;
+}
+###########################################################################
+sub usage{
+###########################################################################
+   say "Usage: pnas -i initials -s|--srdb <srdb num>";
+   say "Usage: pnas -i initials -s|--srdb <srdb num> [-c|--comp <comp num]}";
+   say "Usage: pnas -i initials -s|--srdb <srdb num> [-c|--comp <comp num]} [-m email\@address]";
+   say "Usage: pnas [--template]";
+   exit 1;
+}
+###########################################################################
+sub select_query{
+###########################################################################
+my $select_query=<<END;
+SELECT
+StorageReqs_Server.Server_Name,
+StorageReqs_Request_Component.Growth_Type,
+StorageReqs_Request_Component.Target_Impl_Date,
+StorageReqs_Storage_Request.Request_Status,
+StorageReqs_Request_Component.Request_ID as 'SRDB',
+StorageReqs_Request_Component.Comp_ID as 'Comp',
+StorageReqs_Request_Component.Disk_Subsystem_Name,
+StorageReqs_Request_Component.Connectivity_Type,
+StorageReqs_Request_Component.Comp_Status,
+StorageReqs_Request_Component.NAS_NDMP_Mount_Points,
+StorageReqs_Request_Component.Disk_Product,
+StorageReqs_Storage_Request.AIT_Number
+END
+return $select_query;
+}
+###########################################################################
+sub from_query{
+###########################################################################
+my $from_query=<<END;
+FROM StorageReqs_Request_Component INNER JOIN StorageReqs_Server
+ ON StorageReqs_Request_Component.Server_ID = StorageReqs_Server.Server_ID
+INNER JOIN StorageReqs_Storage_Request ON StorageReqs_Request_Component.Request_ID = StorageReqs_Storage_Request.Request_ID
+INNER JOIN StorageReqs_Users ON StorageReqs_Request_Component.disk_contact_primary_pn  = cast(StorageReqs_Users.PersonNumber as varchar)
+LEFT OUTER JOIN Storagereqs_Users as user_sse ON StorageReqs_Storage_Request.Assigned_CSR = cast(user_sse.PersonNumber as varchar)
+END
+return $from_query;
+}
+###########################################################################
+sub where_query{
+###########################################################################
+#say "$_ " foreach (@comps);exit;
+my $append_txt;
+if ($srdb_num){
+   $append_txt.="AND StorageReqs_Request_Component.Request_ID in ('$srdb_num')\n";
+}
+if (@comps){
+   my $comps;
+   foreach (@comps){
+   $comps.="'$_',";
+   }
+   $comps=~s/,$//g;
+   $append_txt.=" AND StorageReqs_Request_Component.Comp_ID in ($comps)\n";
+}
+   #$append_txt.="AND StorageReqs_Request_Component.Request_ID in ('$srdb_num')\n";
+#say "$append_txt";exit;
+#$append_txt="AND (StorageReqs_Users.FirstName + StorageReqs_Users.LastName in ('CraigDwyer','MichaelDenney','Raja VenkatKondu'))";
+
+my $where_query=<<END;
+WHERE
+(StorageReqs_Request_Component.Growth_Type in ('Growth','Optimization'))
+AND
+(StorageReqs_Request_Component.Comp_Status in ('Capacity Reserved'))
+AND
+(StorageReqs_Request_Component.Connectivity_Type in ('Network Attached'))
+END
+$where_query.=$append_txt if ($append_txt);
+return $where_query;
+}
+###########################################################################
+sub order_query{
+###########################################################################
+my $order_query=<<END;
+ORDER BY
+--convert(datetime,StorageReqs_Request_Component.Target_Impl_Date, 111)
+--convert(StorageReqs_Request_Component.Target_Impl_Date, 111)
+StorageReqs_Request_Component.Request_ID,StorageReqs_Request_Component.Comp_ID
+   --StorageReqs_Request_Component.Request_ID DESC,
+   --StorageReqs_Request_Component.COMP_ID DESC
+END
+return $order_query;
+}

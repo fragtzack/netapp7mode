@@ -1,0 +1,662 @@
+##########################################################
+#  pqtree
+#  Provision a Netapp qtree to BAC standards
+#Michael.S.Denney@gmail.com
+$version=1.63;
+##########################################################
+#TO DO:
+#      
+#Version history
+#1.0 
+#1.1 verify_exports #verifies the export hosts are pingable
+#1.2 --cifs_share --cifs_change --cifs_read
+#1.3 --cifs_change and --cifs_read accepts multiple group names
+#      seperated by : or ,
+#1.4 --noping
+#1.5 Added sanitize sub and @bitmode_results
+#1.6 Added --nfs_rw_file --nfs_ro_file and --nfs_root_file
+#1.61 Added -m 0777 to qtree create
+#1.63 --alt
+###############################################################################
+#TO DO: 
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use POSIX;
+use FindBin;
+use Net::Ping;
+use Net::DNS;
+use Rpt;
+use Common;
+use Netapp;
+
+##################Global VARS#################################
+use vars qw($version $dry_run $alt);
+use vars qw($mail_to @rpt @warn_rpt);
+use vars qw($filer $srdb_comp $vol_name $qtree_name $gb_size);
+use vars qw($initials $help $verbose $debug);
+use vars qw($nfs_rw $nfs_ro $nfs_root $uid $gid $noping);
+use vars qw($nfs_rw_file $nfs_ro_file $nfs_root_file );
+use vars qw($cifs_share $cifs_read $cifs_change @bitmode_results);
+my $date = strftime '%Y%m%d', localtime;
+##################Predeclare SUBS#############################
+use subs qw(usage sanity_check show_results verify_exports);
+use subs qw(add_exports apply_exports apply_chown quota_on);
+use subs qw(qtree_create save_quotas add_quotas quota_resize);
+use subs qw(add_cifs_share add_cifs_access del_cifs_everyone);
+use subs qw (sanitize verify_exports_file netgroup);
+##############################################################
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path=$base."log";
+my $log_file=$log_path."/$script.log";
+my $err_log=$log_path."/$script.err_log";
+##############################################################
+my $cmd_line="$script ";
+$cmd_line .="$_ " foreach (@ARGV);
+
+exit unless GetOptions(
+          'dry' => \$dry_run,
+          'c=s' => \$srdb_comp,
+          'f=s' => \$filer,
+          'n=s' => \$vol_name,
+          'q=s' => \$qtree_name,
+          'g=i' => \$gb_size,
+          'cifs_share=s' => \$cifs_share,
+          'cifs_read=s' => \$cifs_read,
+          'cifs_change=s' => \$cifs_change,
+          'nfs_rw=s' => \$nfs_rw,
+          'nfs_ro=s' => \$nfs_ro,
+          'nfs_root=s' => \$nfs_root,
+          'nfs_rw_file=s' => \$nfs_rw_file,
+          'nfs_ro_file=s' => \$nfs_ro_file,
+          'nfs_root_file=s' => \$nfs_root_file,
+          'uid=i' => \$uid,
+          'gid=i' => \$gid,
+          'noping' => \$noping,
+          'alt' => \$alt,
+          'i=s' => \$initials,
+          'v' => \$verbose,
+          'd' => \$debug,
+          'h' => \$help,
+          'm=s' => \$mail_to
+);
+usage if $help;
+print "verbose on\n" if $verbose;
+print "debug on\n" if $debug;
+$verbose=1 if $debug;
+my $common=Common->new;
+$Common::rpt_log=$log_file;
+my $netapp=Netapp->new;
+$Netapp::srdb_comp=$srdb_comp;
+slogit "INFO $cmd_line";
+sanitize;
+sanity_check;
+qtree_create;
+mount_vol($filer,'vol0',$$);
+my $save_file_name=save_name($$,$filer,'vol0',"etc/quotas.$date.$initials");
+slogit "INFO quota save_file_name->$save_file_name\n";
+my $orig_quotas=get_file($$,$filer,'vol0','etc/quotas');
+save_file($orig_quotas,$$,$filer,'vol0',$save_file_name);
+my $new_quotas=add_quotas($orig_quotas);
+#print "$_\n" foreach (@$new_quotas);exit;
+save_file($new_quotas,$$,$filer,'vol0','/etc/quotas');
+    #umount_vol($filer,'vol0',$$);exit;
+
+if ($cifs_share){
+   add_cifs_share;
+   del_cifs_everyone;
+   if ($cifs_read or $cifs_change){
+      add_cifs_access('read',$cifs_read) if $cifs_read;
+      add_cifs_access('change',$cifs_change) if $cifs_change;
+   }
+}
+if ($nfs_rw or $nfs_ro or $nfs_root or $nfs_rw_file or $nfs_ro_file or $nfs_root_file){
+    #convert the servers names to be seperated by : 
+    
+    my $orig_exports=get_file($$,$filer,'vol0','etc/exports');
+    $save_file_name=save_name($$,$filer,'vol0',"etc/exports.$date.$initials");
+    slogit "INFO exports save_file_name->$save_file_name\n";
+    save_file($orig_exports,$$,$filer,'vol0',$save_file_name);
+    my $new_exports=add_exports($orig_exports);
+    #print "$_\n" foreach (@$new_exports);
+    #umount_vol($filer,'vol0',$$);exit;
+    save_file($new_exports,$$,$filer,'vol0','/etc/exports');
+    apply_exports;
+    apply_chown if ($uid and $gid);
+}
+quota_on;
+umount_vol($filer,'vol0',$$);
+show_results;
+exit;
+##########################################################
+sub sanity_check{
+##########################################################
+   if ($debug){
+      print "filer=>$filer\n";
+      print "vol_name=>$vol_name\n";
+      print "gb_size=>$gb_size\n";
+      print "initials=>$initials\n";
+   }#end if debug
+   unless (($filer) and ($vol_name) and ($gb_size) 
+       and ($qtree_name)  and ($initials)){
+      usage "dont exit";
+      print "error->-c srdb comp\n" unless  $srdb_comp;
+      print "error->-f filer missing\n" unless  $filer;
+      print "error->-n vol name missing\n" unless  $vol_name;
+      print "error->-q qtree name missing\n" unless  $qtree_name;
+      print "error->-g gb_size missing\n" unless  $gb_size;
+      print "error->-i initials missing\n" unless  $initials;
+      exit 1;
+   }
+   if ($uid and ! $gid){
+      print "error->--gid required if --uid\n";
+      exit;
+   }
+   if ($gid and ! $uid){
+      print "error->--uid required if --gid\n";
+      exit;
+   }
+      if ($nfs_rw and $nfs_rw_file){
+      slogit "ERROR can not specify both nfs_rw and nfs_rw_file";
+      exit 1;
+   }
+   if ($nfs_ro and $nfs_ro_file){
+      slogit "ERROR can not specify both nfs_ro and nfs_ro_file";
+      exit 1;
+   }
+   if ($nfs_root and $nfs_root_file){
+      slogit "ERROR can not specify both nfs_root and nfs_root_file";
+      exit 1;
+   }
+   verify_exports_file($nfs_rw_file) if ($nfs_rw_file and ! $noping);
+   verify_exports_file($nfs_ro_file) if ($nfs_ro_file and ! $noping);
+   verify_exports_file($nfs_root_file) if ($nfs_root_file and ! $noping);
+   verify_exports($nfs_rw) if ($nfs_rw and ! $noping);
+   verify_exports($nfs_ro) if ($nfs_ro and ! $noping);
+   verify_exports($nfs_root) if ($nfs_root and ! $noping);
+}
+##########################################################
+sub verify_exports_file{
+##########################################################
+    my $file=shift;
+    my @lines;
+    open FH,$file or die "Unable to open $file:$!\n"; 
+    while (<FH>){
+       chomp;
+       next if /^\s*\#/;
+       s/,/:/g;
+       push @lines,$_ ;
+    }
+    close FH;
+    my $nfs_list=join(":",@lines);
+    $nfs_list=~s/\s+//g;
+    #say $nfs_list;exit;
+    verify_exports($nfs_list);
+}
+##########################################################
+sub sanitize{
+##########################################################
+   $nfs_rw=~s/,/:/g if $nfs_rw;
+   $nfs_ro=~s/,/:/g if $nfs_ro;
+   $nfs_root=~s/,/:/g if $nfs_root;
+   $nfs_rw=lc $nfs_rw if $nfs_rw;
+   $nfs_ro=lc $nfs_ro if $nfs_ro;
+   $nfs_root=lc $nfs_root if $nfs_root;
+   $qtree_name=lc $qtree_name;
+   $vol_name=lc $vol_name;
+}
+##########################################################
+sub del_cifs_everyone{
+##########################################################
+   my $cmd="ssh $filer cifs access -delete $cifs_share everyone";
+   my ($stdout,$stderr);
+   ($stdout,$stderr)=run_cmd $cmd;
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        unless (grep /successfully modified/,@$stderr){
+           slogit "Aborting because error above";
+           umount_vol($filer,'vol0',$$);
+           exit 1;
+        }
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+}
+##########################################################
+sub add_cifs_access{
+##########################################################
+   my $type=shift;
+   my $input=shift;
+   $input=uc $input;
+   $input=~s/,/:/g;#change commas to colon
+   my $cmd;
+   my ($stdout,$stderr);
+   my @access=split /:/,$input;
+   foreach (@access){
+       $cmd="ssh $filer cifs access $cifs_share '$_' $type";
+       print "$cmd\n" if ($dry_run);
+      ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+      if (!$dry_run and @$stderr){
+          slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+          slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+          push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+      }#end if !dry_run and stderr
+      slogit "$_\n" foreach (@$stdout);
+   }#end foreach @access
+}
+##########################################################
+sub add_cifs_share{
+##########################################################
+   $cifs_share=uc $cifs_share;
+   my $cmd="ssh $filer cifs shares -add $cifs_share /vol/$vol_name/$qtree_name -comment SR$srdb_comp";
+   return if $dry_run;
+   print "$cmd\n" if ($dry_run);
+   my ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        unless ((grep /MS-DOS/,@$stderr)and @$stderr == 1){
+           slogit "Aborting because error above";
+           umount_vol($filer,'vol0',$$);
+           exit 1;
+        }
+   }
+   slogit "$_\n" foreach (@$stdout);
+   ##If multiprotocol, lets skip setting security to ntfs;
+   return if ($nfs_rw or $nfs_root or $nfs_ro or $nfs_rw_file or $nfs_ro_file or $nfs_root_file);
+
+   $cmd="ssh $filer qtree security /vol/$vol_name/$qtree_name ntfs";
+   print "$cmd\n" if ($dry_run);
+   ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+   }
+   slogit "$_\n" foreach (@$stdout);
+}
+##########################################################
+sub verify_exports{
+##########################################################
+   my $servers=shift;
+   my $ret_val=1;
+   my @hosts=split(':',$servers);
+   #print "$_ " foreach (@hosts);exit;
+   my $p = Net::Ping->new();
+   foreach my $host (@hosts){
+     slogit "INFO Verifying ping to $host";
+     if ($p->ping($host) ){
+        slogit "INFO $host responds to ping" 
+     } else {
+        $ret_val=0;
+        slogit "ERROR $host does not respond to ping" 
+     }
+   }
+   $p->close();
+   unless ($ret_val){
+      slogit "ERROR aborting because an nfs host does not ping";
+      exit 1;
+   }
+   return $ret_val;
+}
+##########################################################
+sub apply_chown{
+##########################################################
+   my $cmd="ssh $filer exportfs -io rw=chiinfspap02.bankofamerica.com:tx2xpvlxxl.bankofamerica.com,root=chiinfspap02.bankofamerica.com:tx2xpvlxxl.bankofamerica.com /vol/$vol_name";
+   print "$cmd\n" if ($dry_run);
+   my ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+   mount_vol($filer,$vol_name,$$);
+
+
+   $cmd="/bin/chown $uid:$gid /var/tmp/$$/$filer/$vol_name/$qtree_name";
+   print "$cmd\n" if ($dry_run);
+   ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+   $cmd="/bin/ls -ln /var/tmp/$$/$filer/$vol_name";
+   print "$cmd\n" if ($dry_run);
+   ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   @bitmode_results=@$stdout if (@$stdout);
+   umount_vol($filer,$vol_name,$$);
+   $cmd="ssh $filer exportfs /vol/$vol_name";
+   print "$cmd\n" if ($dry_run);
+   ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+}
+##########################################################
+sub quota_on{
+##########################################################
+   my $cmd="ssh $filer quota off $vol_name";
+   return if $dry_run;
+   print "$cmd\n" if ($dry_run);
+   my ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+       slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+       slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+       push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+   say "sleeping for 10...";
+   sleep 10;
+   $cmd="ssh $filer quota on $vol_name";
+   print "$cmd\n" if ($dry_run);
+   ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+       slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+       slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+       push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+       return undef if (@$stderr);
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+}
+##########################################################
+sub quota_resize{
+##########################################################
+   my $cmd="ssh $filer quota resize $vol_name";
+   return if $dry_run;
+   my ($stdout,$stderr)=run_cmd $cmd;
+   if (@$stderr){
+       slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+       #foreach (@$stderr){
+          #if (/quotas not on;resize not done/){
+ #print "going to quota_on\n";
+             #quota_on;
+             return;
+          #}
+       #}
+       slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+       slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+       push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+       return undef if (@$stderr);
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+}
+##########################################################
+sub qtree_create{
+##########################################################
+   my $cmd="ssh $filer qtree create /vol/$vol_name/$qtree_name -m 0777";
+   print "$cmd\n" if ($dry_run);
+   my ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "Aborting because error above";
+        exit 1;
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+}
+##########################################################
+sub apply_exports{
+##########################################################
+   my $cmd="ssh $filer exportfs /vol/$vol_name/$qtree_name";
+   print "$cmd\n" if ($dry_run);
+   my ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "Aborting because error above";
+        umount_vol($filer,'vol0',$$);
+        exit 1;
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+   $cmd="ssh $filer qtree security /vol/$vol_name/$qtree_name unix";
+   print "$cmd\n" if ($dry_run);
+   ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "Aborting because error above";
+        umount_vol($filer,'vol0',$$);
+        exit 1;
+   }
+   slogit "$_\n" foreach (@$stdout);
+}
+##########################################################
+sub add_quotas{
+##########################################################
+   #Append the new qtree to the quota file array 
+   my $new_array=shift;
+   #print "$_\n" foreach (@$new_array);
+   my $qtree_quota="/vol/$vol_name/$qtree_name \ttree\t";
+   $qtree_quota.=$gb_size."G\t-\t-\t-\t-";
+   push @$new_array,$qtree_quota; 
+   return \@$new_array;
+}
+##########################################################
+sub add_exports{
+##########################################################
+   #Append the new qtree to the exports file array 
+   my $new_array=shift;
+   #print "$_\n" foreach (@$new_array);
+   my ($qait,$qapp,$qenv)=split (/_/,$qtree_name);
+   #say "SPLIT=>$qait $qapp $qenv";
+   my $netgroup="\@ngfl_$qapp".$qenv;
+   my $qtree_export="/vol/$vol_name/$qtree_name -sec=sys";
+   $qtree_export.=",rw=$nfs_rw" if $nfs_rw;
+   $qtree_export.=",root=$nfs_root" if $nfs_root;
+   $qtree_export.=",ro=$nfs_ro" if $nfs_ro;
+   $qtree_export.=",rw=$netgroup" if $nfs_rw_file;
+   $qtree_export.=",ro=$netgroup" if $nfs_ro_file;
+   $qtree_export.=",root=$netgroup" if $nfs_root_file;
+   ##filer with netgroups already->mlvtgfsnas23a
+   $qtree_export.=",nosuid #SR$srdb_comp";
+   push @$new_array,$qtree_export; 
+   netgroup($netgroup,$nfs_rw_file) if $nfs_rw_file;
+   netgroup($netgroup.'_ro',$nfs_ro_file) if $nfs_ro_file;
+   netgroup($netgroup.'_root',$nfs_root_file) if $nfs_root_file;
+   slogit "INFO new exports entry=>$qtree_export";
+   return \@$new_array;
+}
+##########################################################
+sub netgroup{
+##########################################################
+   my $netgroup_name=shift;
+   my $exports_file=shift;
+   $netgroup_name=~s/@//g;
+   say "netgroup_name=> $netgroup_name exports_file=> $exports_file";
+   open EXPORTS,$exports_file or die "ERROR Unable to open $exports_file:$!\n";
+   my @exports=(<EXPORTS>);
+   close EXPORTS;
+   chomp @exports;
+   my $netgroup_file=get_file($$,$filer,'vol0','etc/netgroup');
+   if ($netgroup_file){
+       my $save_file_name=save_name($$,$filer,'vol0',"etc/netgroup.$date.$initials");
+       slogit "INFO netgroup save_file_name->$save_file_name\n";
+       save_file($netgroup_file,$$,$filer,'vol0',$save_file_name);
+       #my $cnt;
+       #while (grep /$netgroup_name.$cnt\s+/,@$netgroup_file){
+       #say $netgroup_name.$cnt;
+                    #$cnt++;
+              #}
+       #$netgroup_name.=$cnt;
+   }
+   push @$netgroup_file,"$netgroup_name\t" unless (grep /^$netgroup_name/,@$netgroup_file); #Check if net_group exists
+   foreach (@$netgroup_file){
+       if (/^$netgroup_name/){
+          foreach my $export (@exports){
+             next if ($export =~ /^\s*#/);#dont consider comment lines
+             $export=~s/\s+//g; #remove spaces from hostname
+             $export=lc $export;
+             next if (grep /$export/i,$_);#host might already exist in netgroup
+             $_.="($export,,) ";#add the host!
+          }#end foreach @exports
+       }#end if netgroup_name
+   }#end foreach netgroup_file
+   #say "group exists" if (grep /^$netgroup_name/,@$netgroup_file);
+   #print "SAVE->$_\n" foreach (@$netgroup_file);
+   save_file($netgroup_file,$$,$filer,'vol0','etc/netgroup');
+}
+##########################################################
+sub error_msg{
+##########################################################
+      print "In error msg:\n" if $debug;
+      print "@_\n";
+      open (ERR_FILE,">>$err_log")
+           or die "Unable to open $err_log";
+      print ERR_FILE "@_\n";
+      close ERR_FILE;
+}
+##########################################################
+sub show_results{
+##########################################################
+   slogit "###################################################";
+   slogit "###########  $srdb_comp RESULTS ";
+   slogit "###################################################";
+   my @lun_security;my @qtree_results;
+   my $cmd;
+   if ($nfs_rw or $nfs_ro or $nfs_root or $nfs_rw_file or $nfs_ro_file or $nfs_root_file){
+      $cmd="ssh $filer exportfs |grep $qtree_name|grep -i /$vol_name/";
+      my ($stdout,$stderr)=run_cmd $cmd;
+      if (@$stderr){
+           slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+           slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+           push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+           return undef if (@$stderr);
+      }
+      #slogit "$_" foreach (@$stdout);
+      push @lun_security,@$stdout;
+   }
+
+   if ($cifs_share){
+       my $cmd="ssh $filer cifs shares $cifs_share";
+       my ($stdout,$stderr)=run_cmd $cmd;
+       if (@$stderr){
+            slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+            slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+            push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+       }
+       #slogit "$_" foreach (@$stdout);
+       push @lun_security,@$stdout;
+   }
+   push @lun_security,"     ";
+   #say $_ foreach (@lun_security);
+
+   say "sleeping for 10...";
+   sleep 10;
+   my @quotas;
+   $cmd="ssh $filer quota report|grep -i $qtree_name|grep -i /$vol_name/";
+   my ($stdout,$stderr)=run_cmd $cmd;
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+   }
+   #slogit "$_\n" foreach (@$stdout);
+   push @quotas,@$stdout;
+   if ($cifs_share){
+      #print "\\\\$filer\\$cifs_share\n";
+      unshift @lun_security,"\\\\".get_fqdn($filer)."\\$cifs_share"
+   };
+   if ($nfs_rw or $nfs_ro or $nfs_root or $nfs_rw_file or $nfs_ro_file or $nfs_root_file){
+      #print "$filer:/vol/$vol_name/$qtree_name\n";
+      unshift @lun_security,get_fqdn($filer).":/vol/$vol_name/$qtree_name"
+   }
+
+   if (@bitmode_results){
+      slogit "##########################";
+      slogit "#$srdb_comp ZONING REQUEST";
+      slogit "##########################";
+      slogit $_ foreach (@bitmode_results);
+      if ($alt){
+         print "DISPLAY $srdb_comp ZONING REQUEST=$_\n" foreach (@bitmode_results);
+      }
+
+      push @qtree_results,"##########################";
+      push @qtree_results,"#$srdb_comp ZONING REQUEST";
+      push @qtree_results,"##########################";
+      push @qtree_results,@bitmode_results;
+   }
+   slogit "##########################";
+   slogit "#$srdb_comp LUNS CARVED";
+   slogit "##########################";
+   slogit $_ foreach (@quotas);
+   if ($alt){
+      print "DISPLAY $srdb_comp LUNS CARVED=$_\n" foreach (@quotas);
+   }
+   push @qtree_results,"##########################";
+   push @qtree_results,"#$srdb_comp LUNS CARVED";
+   push @qtree_results,"##########################";
+   push @qtree_results,@quotas;
+   slogit "##########################";
+   slogit "#$srdb_comp LUN SECURITY";
+   slogit "##########################";
+   slogit $_ foreach (@lun_security);
+   if ($alt){
+      print "DISPLAY $srdb_comp LUNS SECURITY=$_\n" foreach (@lun_security);
+   }
+   push @qtree_results,"##########################";
+   push @qtree_results,"#$srdb_comp LUN SECURITY";
+   push @qtree_results,"##########################";
+   push @qtree_results,@lun_security;
+
+   Netapp::write_srdb_results('qtree_err',\@warn_rpt);
+   Netapp::write_srdb_results('qtree_create',\@qtree_results);
+}
+##########################################################
+sub usage{
+##########################################################
+   print "NAME\n";
+   print "       $script - Create a Netapp qtree to BAC standards\n";
+   print "\nSYNOPSIS\n";
+   print "       $script -c <srdb.comp> -f <filer> -n <vol_name> -q <qtree_name> -g <gb_size> -i <initials> [--nfs_rw <server_list> [--nfs_ro <server_list> [--nfs_root <server_list>] [--uid <#>] [--gid <#>] [--noping] [--cifs_chare <name>] [--cifs_read <list>] [--cifs_change <list>] [-h] [-o] [-d] [-v] [--dry]\n";
+   print "\nOPTIONS\n";
+   print "       -c <comp> = srdb comp number\n";
+   print "       -f <filer> = filer name to create vol on\n";
+   print "       -n <vol_name> = vol name\n";
+   print "       -q <qtree_name> = qtree name\n";
+   print "       -g <gb_size> = vol size in gb\n";
+   print "       [--nfs_rw <server_list>] = servers to nfs export rw\n";
+   print "       [--nfs_ro <server_list>] = servers to nfs export ro\n";
+   print "       [--nfs_root <server_list>] = servers to nfs export root\n";
+   print "       [--nfs_rw_file = file name with servers to nfs export rw\n";
+   print "       [--nfs_ro_file = file name with servers to nfs export ro\n";
+   print "       [--nfs_root_file = file name with servers to nfs export root\n";
+   print "       [--uid <#> = UID to chown the qtree root directory\n";
+   print "       [--gid <#> = GID to chown the qtree root directory\n";
+   print "       [--noping  = Do not perform ping test\n";
+   print "       [--cifs_share <name>] = CIFS share name\n";
+   print "       [--cifs_read <list>] = AD group(s)/account(s) for read only CIFS access\n";
+   print "       [--cifs_change <list>] = AD group(s)/account(s) for change CIFS access\n";
+   print "       [--alt] = Alternate results display\n";
+   print "       [--dry]  = dry run\n";
+   print "       [-d]  = debug\n";
+   print "       [-v]  = verbose\n";
+   print "       [-h]  = help\n";
+   print "       [] indicates optional parameters\n";
+   print "\n\n";
+   print "NFS exports cifs group/account  names can be seperated by comma or colon\n";
+   print "If the domain specification for cifs_read or cifs_change is given,then the <list> needs to be enclosed in single quotes\n";
+   exit unless shift;
+}

@@ -1,0 +1,755 @@
+##########################################################
+#psm  
+#  Provision a Netapp snapmirror to BAC standards
+#Michael.S.Denney@gmail.com
+$version=2.12;
+##########################################################
+#TO DO:
+#      
+#Version history
+#1.0 initial
+#1.1 vsm_init
+#1.2 sync_sched
+#1.3 $source and $dest
+#1.4 restrict_vol
+#1.5 get_src_exports_quotas put_dst_exports_quotas
+#1.6 show_results
+#1.7 get_src_cifs put_dst_cifs
+#1.8 del_cifs_everyone
+#1.9 cifs shares duplication for qtree
+#1.99 results now show cifs URI or nfs URI
+#2.00 added --cifs_share --source_cifs_charge , etc
+#2.10 check for 64/32 bit vol on both source/dest
+#2.11 skipping bit check if qtrees specified
+#2.12 exportfs applied if nfs apply_exports
+###############################################################################
+#TO DO: 
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use POSIX;
+use FindBin;
+use POSIX 'strftime';
+use File::Basename;
+use Rpt;
+use Common;
+use Netapp;
+##################Global VARS#################################
+use vars qw($version $dry_run);
+use vars qw($mail_to @rpt @warn_rpt);
+use vars qw($filer $dest_filer $srdb_comp $vol $dest_vol);
+use vars qw($src_qtree $dst_qtree);
+use vars qw($initials $help $override $verbose $debug);
+use vars qw($minute $hour $day $week);
+use vars qw($source $dest $cifs_share $nfs_export);
+use vars qw($nfs_rw $nfs_ro $nfs_root);
+use vars qw($source_cifs_share $cifs_share $cifs_read $cifs_change);
+my $date = strftime '%Y%m%d', localtime;
+my $snap=1000; #preset snap to 1000 as a figure to test if snao
+              #parameter exists or not
+##################Predeclare SUBS#############################
+use subs qw(usage sanity_check show_results);
+use subs qw(snapmirror_enable snapmirror_access legacy_snapmirror_access);
+use subs qw(vsm_init sync_sched restrict_vol);
+use subs qw(get_src_exports_quotas put_dest_exports_quotas);
+use subs qw(get_src_cifs get_cifs_share_access put_dst_cifs);
+use subs qw(del_cifs_everyone apply_exports);
+##############################################################
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path=$base."log";
+my $log_file=$log_path."/$script.log";
+my $err_log=$log_path."/$script.err_log";
+##############################################################
+my $cmd_line="$script ";
+$cmd_line .="$_ " foreach (@ARGV);
+
+exit unless GetOptions(
+          'dry' => \$dry_run,
+          'c|comp=s' => \$srdb_comp,
+          'f|filer=s' => \$filer,
+          't|dest_filer=s' => \$dest_filer,
+          'n|source_vol=s' => \$vol,
+          'o|dest_vol=s' => \$dest_vol,
+          'i=s' => \$initials,
+          'q|source_qtree=s' => \$src_qtree,
+          'z|dest_qtree=s' => \$dst_qtree,
+          'source_cifs_share=s' => \$source_cifs_share,
+          'cifs_share=s' => \$cifs_share,
+          'cifs_read=s' => \$cifs_read,
+          'cifs_change=s' => \$cifs_change,
+          'min|minute=s' => \$minute,
+          'hour=s' => \$hour,
+          'day=s' => \$day,
+          'week=s' => \$week,
+          'nfs_rw=s' => \$nfs_rw,
+          'nfs_ro=s' => \$nfs_ro,
+          'nfs_root=s' => \$nfs_root,
+          'v|verbose' => \$verbose,
+          'd|debug' => \$debug,
+          'h|help' => \$help,
+          'm|mail=s' => \$mail_to
+);
+usage if $help;
+
+#print "verbose on\n" if $verbose;
+#print "debug on\n" if $debug;
+##########################################################
+##                MAIN
+##########################################################
+$verbose=1 if $debug;
+my $common=Common->new;
+$Common::rpt_log=$log_file;
+my $netapp=Netapp->new;
+$Netapp::srdb_comp=$srdb_comp;
+slogit "INFO $cmd_line";
+sanity_check;
+snapmirror_enable;
+snapmirror_access;
+restrict_vol unless ($src_qtree or $dst_qtree);
+vsm_init;
+sync_sched;
+my $repl_exports=get_src_exports_quotas('exports');
+put_dest_exports_quotas($repl_exports,'exports');
+apply_exports($dest_filer,$repl_exports);
+my $repl_quotas=get_src_exports_quotas('quotas');
+put_dest_exports_quotas($repl_quotas,'quotas');
+my $src_cifs=get_src_cifs;
+put_dst_cifs($src_cifs);
+cifs_share_access($src_cifs);
+show_results;
+exit;
+##########################################################
+sub cifs_share_access{
+##########################################################
+   my $shares=shift;
+   foreach my $share(keys %$shares){
+      slogit "INFO Adding cifs access for $share on $dest_filer";
+      foreach my $access_line (@{$$shares{$share}{access}}){
+          #say "access line->$access_line";
+          my ($acl,$type)=split / \/ /,$access_line;
+          $acl=~s/^\s+//;
+          #say "acl->$acl";
+          #say "type->$type";
+          my $cmd="ssh $dest_filer cifs access $share $acl $type";
+          print "cmd->$cmd\n" if $dry_run;
+          my ($stdout,$stderr)=run_cmd $cmd unless $dry_run;
+          if (@$stderr){
+               slogit "ERROR STDOUT $_" foreach (@$stdout);
+               slogit "ERROR STDERR $_" foreach (@$stderr);
+               push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+               unless (grep /successfully modified/,@$stderr){
+                  slogit "Aborting because error above";
+                  exit 1;
+               }
+          }#end if @$stderr
+          slogit "INFO $_\n" foreach (@$stdout);
+      }#end foreach my $access_line
+   }#end foreach my $share
+}
+##########################################################
+sub del_cifs_everyone{
+##########################################################
+   my $del_filer=shift;
+   my $cifs_share=shift;
+   slogit "INFO Removing everyone cifs access from recently created $cifs_share";
+   my $cmd="ssh $del_filer cifs access -delete $cifs_share everyone";
+   print "cmd->$cmd\n" if $dry_run;
+   my ($stdout,$stderr)=run_cmd $cmd unless $dry_run;
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        unless (grep /successfully modified/,@$stderr){
+           slogit "Aborting because error above";
+           exit 1;
+        }
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+}
+##########################################################
+sub put_dst_cifs{
+##########################################################
+   slogit "INFO Creating cifs shares on $dest_filer for source vol->$vol,dest_vol->$dest_vol";
+   my $shares=shift;
+   my $cmd;
+   foreach my $share(keys %$shares){
+      $cmd="ssh $dest_filer cifs shares -add $share $$shares{$share}{path} -comment \\\'$$shares{$share}{comment}\\\'" if $$shares{$share}{comment};
+      $cmd="ssh $dest_filer cifs shares -add $share $$shares{$share}{path}" unless $$shares{$share}{comment};
+      print "cmd->$cmd\n" if $dry_run;
+      my ($stdout,$stderr)=run_cmd $cmd unless $dry_run;
+      if (@$stderr ){
+           slogit "ERROR STDOUT $_" foreach (@$stdout);
+           slogit "ERROR STDERR $_" foreach (@$stderr);
+           push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+           unless (grep /MS-DOS/,@$stderr){
+                  slogit "Aborting because error above";
+                  exit 1;
+           }
+      }#end if stderr
+      del_cifs_everyone($dest_filer,$share);
+   }#end foreach my $share
+}
+##########################################################
+sub get_src_cifs{
+##########################################################
+   slogit "INFO checking for CIFS shares for filer->$filer vol->$vol";
+   #slogit "INFO checking for CIFS dest filer->$dest_filer dest_vol->$dest_vol";
+   my %shares;
+   my $cmd="ssh $filer cifs shares";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because error above";
+        exit 1;
+   }
+   foreach (@$stdout){
+      if (/^(\S+)\s+(\/vol\/$vol\s+|\/vol\/$vol\/\S+\s+)(.*)?/){
+          #print "$_\n";
+          #print "share->$1\n"; 
+          #print "path->$2\n"; 
+          #print "comment->$3\n" if $3; 
+          my $share=$1;
+          my $path=$2;
+          my $comment=$3;
+          $share=uc $share;
+          if ($src_qtree ){
+             next unless ($path=~/\/vol\/$vol\/$src_qtree/ );
+             $path=~s/$src_qtree/$dst_qtree/i;
+          }
+          $path=~s/\/$vol\//\/$dest_vol\//; #for paths
+          $path=~s/\/$vol /\/$dest_vol /;   #for just vols
+          #print "New path => $path\n";
+          $shares{$share}{path}=$path;
+          $comment.=" SR$srdb_comp"; 
+          $shares{$share}{comment}=$comment; 
+      }#end if regexpr
+   }#end foreach @$stdout
+   print "#########################\n"; 
+   foreach my $share (keys %shares){
+      $shares{$share}{access}=get_cifs_share_access($share);
+      if ($verbose){
+          print "share->$share path->$shares{$share}{path} comment->";
+          print $shares{$share}{comment} if $shares{$share}{comment};
+          print "\n";
+          print "$share ACCESS->$_\n" foreach (@{$shares{$share}{access}});
+      }
+          if (uc $share eq uc $source_cifs_share){
+             $shares{$cifs_share}{access}=$shares{$share}{access};
+             $shares{$cifs_share}{path}=$shares{$share}{path};
+             $shares{$cifs_share}{comment}=$shares{$share}{comment};
+             $shares{$cifs_share}{access}=$shares{$share}{access};
+             slogit "INFO New share name -> $cifs_share";
+             delete $shares{$share};
+          }
+   }#end foreach my $share (%shares)
+   #foreach (keys %shares){
+      #print "$_ ACCESS->\n";
+      #print "$_ \n" foreach (@{$shares{$_}{access}});
+   #}
+   return \%shares;
+}#end sub
+##########################################################
+sub get_cifs_share_access{
+##########################################################
+    my $share = shift;
+    slogit "INFO Getting CIFS access info for $filer $share";
+    my @ret_array;
+    my $cmd="ssh $filer cifs shares $share";
+    my ($stdout,$stderr)=run_cmd($cmd);
+    if (@$stderr){
+         slogit "ERROR STDOUT $_" foreach (@$stdout);
+         slogit "ERROR STDERR $_" foreach (@$stderr);
+         push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+         slogit "ERROR Aborting because error above";
+         exit 1;
+    }#end if @$stderr
+    print "########################\n" if $debug;
+    print "###get_cifs_share_access\n" if $debug;
+    print "########################\n" if $debug;
+    ##does the share name have $?
+    my $dollar;
+    if ($share =~ s/\$//){
+       print "Dollar sign detected in share name\n" if $debug;
+       $dollar=1;
+    }
+    foreach (@$stdout){
+       next if /^Name\s+Mount\s+Point/;
+       next if /^----/;
+       next if (/^$share/i and not $dollar); 
+       next if (/^$share\$/i and $dollar); 
+       $_=~s/\\/\\\\/;
+       push @ret_array,$_;
+       print "$_\n"  if $debug;
+       #print "$_\n" ; 
+    }
+    print "########################\n" if $debug;
+    if ($cifs_read){
+       $cifs_read=uc $cifs_read;
+       $cifs_read=~s/,/:/g;
+       my @access=split /:/,$cifs_read;
+       foreach (@access){
+          #say $_;
+          push @ret_array,"   $_ / Read";
+       }
+    }
+    if ($cifs_change){
+       $cifs_change=uc $cifs_change;
+       $cifs_change=~s/,/:/g;
+       my @access=split /:/,$cifs_change;
+       foreach (@access){
+          #say $_;
+          push @ret_array,"   $_ / Change";
+       }
+    }
+    return \@ret_array;
+}
+##########################################################
+sub put_dest_exports_quotas{
+##########################################################
+   my $src_file=shift;
+   my $file_type=shift;
+   slogit "INFO Appending to dest $file_type";
+   return unless @$src_file;
+   return unless $file_type;
+   mount_vol($dest_filer,'vol0',$$);
+   my $save_file_name=save_name($$,$dest_filer,'vol0',"etc/$file_type.$date.$initials");
+   my $dest_file=get_file ($$,$dest_filer,'vol0',"etc/$file_type"); 
+   save_file($dest_file,$$,$dest_filer,'vol0',$save_file_name);
+   #foreach (@$dest_exports){
+     #print "$_\n";
+   #}
+   my $add_flag;
+   foreach (@$src_file){
+     #first make sure the entry does not already exist in dest..
+     my @line=split /\s+/;
+     slogit "DEBUG checking for $line[0] in $dest_filer $file_type\n" if $debug;
+     next if (grep /^$line[0]/,@$dest_file);
+     #if here, then the line in question does not exist in dest
+     slogit "INFO Adding to dest $file_type->$_\n";
+     push @$dest_file,"$_";
+     $add_flag=1;
+   }
+   save_file($dest_file,$$,$dest_filer,'vol0',"etc/$file_type") if $add_flag;
+   umount_vol($dest_filer,'vol0',$$);
+}
+##########################################################
+sub get_src_exports_quotas{
+##########################################################
+   my $file_type=shift;
+   slogit "INFO Getting source $file_type";
+   my @ret_array;
+   mount_vol($filer,'vol0',$$);
+   my $src_file=get_file ($$,$filer,'vol0',"etc/$file_type"); 
+   umount_vol($filer,'vol0',$$);
+   foreach (@$src_file){
+      next if /^#/;#skip commented out lines
+      next if /^\s*#/;#skip commented out lines
+      next if /^\s*$/;#skip empty lines
+      if (/^\/vol\/$vol\/(\S+)\s+/){#this skips lines without qtree name
+          #print "$_\n";
+          s/\/$vol\//\/$dest_vol\//;#change the source vol to dest vol
+          push @ret_array,"$_#SR$srdb_comp" ;
+      };#end if /vol $dest
+   }#end foreach @src_file
+   if (($nfs_rw or $nfs_ro or $nfs_root) and ($file_type eq 'exports')){
+      my $hosts;
+      $hosts=",rw=$nfs_rw" if $nfs_rw;
+      $hosts.=",ro=$nfs_ro" if $nfs_ro;
+      $hosts.=",root=$nfs_root" if $nfs_root;
+      foreach (@ret_array){
+         my @line=split /\s+/,$_;
+         $_="$line[0] -sec=sys$hosts,nosuid $line[2]";
+      }
+   }#if $nfs
+   #foreach (@ret_array){
+     #print "$_\n";
+   #}
+   return \@ret_array;
+}
+##########################################################
+sub restrict_vol{
+##########################################################
+#First lets make sure no qtrees exist in the dest vol
+# because we only want to restrict an empty vol!
+   slogit "INFO Checking dest_vol has no qtrees before restricting";
+   my $cmd="ssh $dest_filer qtree status $dest_vol";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because error above";
+        exit 1;
+   }
+   my $qtrees;
+   foreach (@$stdout){
+      next if /^Volume\s+/;
+      next if /^\-+\s+/;
+      next if /^$dest_vol\s+\S+\s+\S+\s+\S+\s*$/;
+      $qtrees.="$1 " if (/^\S+\s+(\S+)/); #Any remaining lines are qtrees
+      #print "$_\n";
+   }
+   if ($qtrees){
+       slogit "ERROR Qtrees exist in dest vol $dest_vol\n";
+       slogit "ERROR Qtrees existing->$qtrees";
+       slogit "ERROR Aborting because qtrees exist";
+       exit 1;
+   }
+ 
+   slogit "INFO Restricting destination volume";
+   $cmd="ssh $dest_filer vol restrict $dest_vol";
+   ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because error above";
+        exit 1;
+   }
+   print "$_\n" foreach (@$stdout);
+}
+##########################################################
+sub sync_sched{
+##########################################################
+#create entry in snapmirror.conf on dest filer
+   $minute=30 unless $minute;
+   $hour=23 unless $hour;
+   $day="*" unless $day;
+   $week="*" unless $week;
+   slogit "INFO adding entry to $dest_filer snapmirror.conf";
+   mount_vol($dest_filer,'vol0',$$);
+   my $stdout=get_file($$,$dest_filer,'vol0','etc/snapmirror.conf');
+   slogit "INFO Backing up etc/snapmirror.snapmirror.conf";
+   return if $dry_run;
+   save_file($stdout,$$,$dest_filer,'vol0',"etc/snapmirror.conf.$date.$initials");
+   push @$stdout,"$source $dest - $minute $hour $day $week";
+   #foreach (@$stdout){
+      #print "$_\n";
+   #}
+   save_file($stdout,$$,$dest_filer,'vol0','etc/snapmirror.conf');
+   umount_vol($dest_filer,'vol0',$$);
+
+}
+##########################################################
+sub vsm_init{
+##########################################################
+   #initialize a volume snapmirror(now used for both qsm/vsm)
+   my $cmd="ssh $dest_filer snapmirror initialize -S $source $dest";
+   return if $dry_run;
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because error above";
+        exit 1;
+   }
+   slogit "$_\n" foreach (@$stdout);
+}
+
+##########################################################
+sub legacy_snapmirror_access{
+##########################################################
+#legacy  check and set snapmirror access on source
+   my $fqdn_dest=lc get_fqdn($dest_filer);
+   slogit "INFO legacy snapmirror access detected";
+   mount_vol($filer,'vol0',$$);
+   my $stdout=get_file($$,$filer,'vol0','etc/snapmirror.allow');
+   #foreach (@$stdout){
+      #print "$_\n";
+   #}
+   unless (grep /$dest_filer/i,@$stdout){
+       slogit "INFO Backing up etc/snapmirror.allow";
+       save_file($stdout,$$,$filer,'vol0',"etc/snapmirror.allow.$date.$initials");
+       slogit "INFO Adding $fqdn_dest to legacy etc/snapmirror.allow";
+       #push @$stdout,$fqdn_dest;
+       push @$stdout,$dest_filer;
+       save_file($stdout,$$,$filer,'vol0','etc/snapmirror.allow');
+   }
+   umount_vol($filer,'vol0',$$);
+ 
+
+return;
+}
+##########################################################
+sub snapmirror_access{
+##########################################################
+   #check and set snapmirror access on source
+   my $fqdn_dest=get_fqdn($filer);
+   my $cmd="ssh $filer options snapmirror.access";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because error above";
+        exit 1;
+   }
+   #slogit "$_" foreach (@$stdout);
+   if (grep /legacy/i,@$stdout){
+      legacy_snapmirror_access ;
+   }else{ unless (grep /$dest_filer/i,@$stdout){#if dest_filer not here
+                  my $new_hosts = join("",@$stdout);
+                  $new_hosts=~s/\s+$//; #remove any trailing white space
+                  #$new_hosts.=",$fqdn_dest";
+                  $new_hosts.=",$dest_filer";
+                  slogit "NEW $new_hosts\n";
+                  $cmd="ssh $filer options $new_hosts";
+                  my ($stdout,$stderr)=run_cmd($cmd);
+                  if (@$stderr){
+                       slogit "ERROR STDOUT $_" foreach (@$stdout);
+                       slogit "ERROR STDERR $_" foreach (@$stderr);
+                       push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+                       slogit "ERROR Aborting because error above";
+                       exit 1;
+                  }#end if @$stderr
+                  print "$_\n" foreach (@$stdout);
+         }#end unless
+   }#end else
+   slogit "INFO snapmirror access complete";
+   return;
+}
+##########################################################
+sub snapmirror_enable{
+##########################################################
+   #make sure snapmirror is enabled on source and dest
+   slogit "INFO Enable snapmirror on $filer";
+   my $cmd="ssh $filer options snapmirror.enable on";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because error above";
+        exit 1;
+   }
+   print "$_\n" foreach (@$stdout);
+
+   slogit "INFO Enable snapmirror on $dest_filer";
+   $cmd="ssh $dest_filer options snapmirror.enable on";
+   ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because error above";
+        exit 1;
+   }
+   slogit "INFO Snapmirror enable complete";
+   return;
+}
+##########################################################
+sub sanity_check{
+##########################################################
+   if ($debug){
+      print "filer=>$filer\n";
+      print "source vol_name=>$vol\n";
+      print "dest vol_name=>$dest_vol\n";
+      print "initials=>$initials\n";
+   }#end if debug
+   unless (($filer) and ($dest_filer)and ($vol) and ($dest_vol) and ($initials) ){
+      usage "dont_exit";
+      print "ERROR->-c srdb.comp missing\n" unless  $srdb_comp;
+      print "ERROR->-f filer missing\n" unless  $filer;
+      print "ERROR->-t dest filer missing\n" unless  $dest_filer;
+      print "ERROR->-n source vol_name missing\n" unless  $vol;
+      print "ERROR->-o dest vol_name missing\n" unless  $dest_vol;
+      print "ERROR->-i initials missing\n" unless  $initials;
+      exit 1;
+   }
+   if ($src_qtree and ! $dst_qtree){
+      print "ERROR->-dest qtree must be specified if source qtree\n";
+      exit 1;
+   }
+   if ($dst_qtree and ! $src_qtree){
+      print "ERROR->-source qtree must be specified if dest qtree\n";
+      exit 1;
+   }
+    my $src_filer=lc get_fqdn($filer);
+   if ($vol and $dest_vol){
+      $source="$src_filer:$vol";
+      $dest="$dest_filer:$dest_vol";
+   }
+   if ($src_qtree and $dst_qtree){
+      $source="$src_filer:/vol/$vol/$src_qtree";
+      $dest="$dest_filer:/vol/$dest_vol/$dst_qtree";
+   }
+   if ($source_cifs_share and ! $cifs_share){
+      print "ERROR->cifs_share must be specified if source_cifs_share\n";
+      exit 1;
+   }
+   if ($cifs_share and ! $source_cifs_share){
+      print "ERROR->source_cifs_share must be specified if cifs_share\n";
+      exit 1;
+   }
+
+   $nfs_rw=~s/,/:/g if $nfs_rw;
+   $nfs_ro=~s/,/:/g if $nfs_ro;
+   $nfs_root=~s/,/:/g if $nfs_root;
+   $nfs_rw=lc $nfs_rw if $nfs_rw;
+   $nfs_ro=lc $nfs_ro if $nfs_ro;
+#check that the source and destination filer are both 64 or both 32 bits
+#check that the source and destination filer:vol exist
+   slogit "INFO Checking $vol exists on $filer";
+   my $cmd="ssh $filer vol status $vol";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because error above";
+        exit 1;
+   }
+   my @source_bits=grep /-bit/,@$stdout;
+   chomp @source_bits;
+   s/\s+//g foreach (@source_bits);
+   slogit "INFO source vol $vol bits=>@source_bits<=\n";
+   #slogit "$_\n" foreach (@$stdout);
+
+   slogit "INFO Checking $dest_vol exists on $dest_filer";
+   $cmd="ssh $dest_filer vol status $dest_vol";
+   ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because error above";
+        exit 1;
+   }
+   #$dest_bits=join(grep /-bit/,@$stdout);
+   my @dest_bits=grep /-bit/,@$stdout;
+   chomp @source_bits;
+   s/\s+//g foreach (@dest_bits);
+   slogit "INFO dest vol $dest_vol bits=>@dest_bits<=\n";
+   if ((@source_bits != @dest_bits)and (! $src_qtree)){
+      slogit ("ERROR Aborting because the source vol and dest vol are different vol bits");
+      exit 1;
+   } 
+   slogit "INFO qtree specified, no bit check" if ($src_qtree);
+   #slogit "$_\n" foreach (@$stdout);
+}
+##########################################################
+sub apply_exports{
+##########################################################
+   my $filer=shift;
+   my $repl_exports=shift;
+   next unless @$repl_exports;
+   my $path;
+   foreach (@$repl_exports){
+     #say "$_";
+     $path=$1 if (/^(\S+)\s+/);
+     say "path=>$path";
+   }
+   my $cmd="ssh $filer exportfs $path";
+   print "$cmd\n" if ($dry_run);
+   my ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "Aborting because error above";
+        umount_vol($filer,'vol0',$$);
+        exit 1;
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+return;
+=cut
+   $cmd="ssh $filer qtree security $path unix";
+   print "$cmd\n" if ($dry_run);
+   ($stdout,$stderr)=run_cmd $cmd unless ($dry_run);
+   if (!$dry_run and @$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "Aborting because error above";
+        umount_vol($filer,'vol0',$$);
+        exit 1;
+   }
+   slogit "$_\n" foreach (@$stdout);
+exit;
+=cut
+}
+
+##########################################################
+sub show_results{
+##########################################################
+   slogit "###################################################";
+   slogit "###########  $srdb_comp $script RESULTS ";
+   slogit "###################################################";
+
+   my $cmd="ssh $dest_filer snapmirror status|grep $dest_filer:$dest_vol";
+   if ($dst_qtree){
+      $cmd="ssh $dest_filer snapmirror status|grep $dest_filer:/vol/$dest_vol/$dst_qtree";
+   }
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "$_\n" foreach (@$stdout);
+   $cmd="ssh $dest_filer exportfs | grep $dest_vol";
+   ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "$_\n" foreach (@$stdout);
+   slogit "##########################";
+   slogit "###   LUN SECURITY    ####";
+   slogit "##########################";
+   slogit "\\\\".get_fqdn(uc $dest_filer)."\\$_\n" foreach (keys %$src_cifs);
+   foreach (@$repl_exports){
+      my @line=split /\s+/;
+      slogit get_fqdn($dest_filer).":$line[0]\n" 
+   }
+}
+##########################################################
+sub usage{
+##########################################################
+   print "NAME\n";
+   print "       $script - Create Netapp snapmirror to BAC standards\n";
+   print "\nSYNOPSIS\n";
+   print "       $script [-c <srdb.comp>] -f <source filer> -t <dest filer> -n <source vol> -o <dest vol> -i <initials> [-q <src qtree> [-z <dest qtree>] [-h] [-o] [-d] [-v] [--dry]\n";
+   print "\nOPTIONS\n";
+   print "       -c|--comp <comp> = srdb comp number\n";
+   print "       -f|--filer <filer> = source filer name\n";
+   print "       -t|--dest_filer <filer> = dest filer name\n";
+   print "       -n|--source_vol  <source vol> = source vol name\n";
+   print "       -o|--dest_vol  <dest vol> = dest vol name\n";
+   print "       -i <initials> = user initials used for backups\n";
+   print "       [--min <min> = sync schedule minute\n";
+   print "       [--hour <hour> = sync schedule hour\n";
+   print "       [--day <day > = sync schedule day of month\n";
+   print "       [--week <week> = sync schedule day of week\n";
+   print "       [-q <src qtree>] = optional source qtree\n";
+   print "       [-z <dest qtree>] = dest qtree,required if -q option\n";
+   print "       [-nfs_rw <server_list>] = hosts to grant rw access\n";
+   print "       [-nfs_ro <server_list>] = hosts to grant ro access\n";
+   print "       [-nfs_root <server_list>] = hosts to grant root access\n";
+   print "       [--source_cifs_share <share_name> = source cifs share name\n";
+   print "       [--cifs_share <share_name> = new cifs share name\n";
+   print "       [--cifs_read <list>] = AD group(s)/account(s) for read only CIFS access\n";
+   print "       [--cifs_change <list>] = AD group(s)/account(s) for change CIFS access\n";
+   print "       [--dry]  = dry run\n";
+   print "       [-d|--debug]  = debug\n";
+   print "       [-v|--verbose]  = verbose\n";
+   print "       [-h|--help]  = help\n";
+   print "       [] indicates optional parameters\n";
+   print "\n\n";
+   print "       Default schedule is 30 23 * * unless specified\n";
+   print "NFS exports cifs group/account  names can be seperated by comma or colon\n";
+   print "The NFS exports are copied from the source qtrees found,unless the --nfs_rw,--nfs_ro or --nfs_root options are specified\n";
+
+   print "Logs are kept @ $log_path\n";
+   exit unless shift;
+}

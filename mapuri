@@ -1,0 +1,958 @@
+##########################################################
+# map_uri
+# Given an input nas uri, map the details 
+# NFS uri-> filer:/vol/<vol>/<qtree>" 
+# CIFs uri-> \\filer_name\share_name
+#Michael.S.Denney@gmail.com
+$version=1.02;
+##########################################################
+#TO DO: 
+#Version history
+##########################################################
+
+use strict;
+use warnings;
+use Getopt::Long;
+use IPC::Open3;
+use IO::Select; # for select
+use Symbol; # for gensym
+use Data::Dumper;
+use Rpt;
+use Common;
+use Netapp;
+use POSIX;
+##################Global VARS#################################
+use vars qw($version $verbose $debug $sm_type @rpt $uri $mail_to);
+use vars qw(@snapmirrors @aggr @vol @qtree @quota );
+use vars qw(@nfs @cifs @snapshot @key %hoa);
+# %filer_vol_qtrees is a Hash of Hash of arrays
+##################Predeclare SUBS#############################
+use subs qw(real_filer_name cifs_access get_quota send_email);
+use subs qw(get_snapmirror get_df cifs_shares exports quota_report);
+use subs qw(qtree_status get_sm_uris get_vol_status);
+use subs qw(determine_vol_qtree determine_uri get_aggr_status);
+use subs qw(verify_vol_qtree get_bitmode get_aggr_df);
+use subs qw(mirror_state );
+##############################################################
+$Common::log_off=1;
+exit 1 unless GetOptions(
+          'm|mail=s' => \$mail_to,
+          'u|uri=s' => \$uri,
+          'v' => \$verbose,
+          'd' => \$debug
+);
+print "verbose on\n" if $verbose;
+print "debug on\n" if $debug;
+$verbose=1 if $debug;
+unless ($uri) {
+   print "Usage: mapuri --uri <nfs or cifs uri> [--mail <email address>]\n";
+   print "              Where --uri is required, --mail is optional\n";
+   exit 1 ;
+}
+say "Performing analysis of $uri" if $debug;
+my($orig_filer,$remains)=determine_uri($uri);
+$orig_filer=lc $orig_filer;$remains=lc $remains;
+#say "orig_filer=>$orig_filer";
+my $real_filer=real_filer_name($orig_filer);
+#say "real_filer=>$real_filer";
+my ($vol,$qtree,$path)=determine_vol_qtree($orig_filer,$remains);
+my ($qtree_security,$qtree_oplocks,$qtree_sm)=get_qtree($orig_filer,$qtree,$vol);
+my $snap_mirrors=get_snapmirror($orig_filer,$vol,$path);
+my ($vol_capacity,$vol_used,$vol_avail,$vol_percent,$snap_capacity,$snap_used,$snap_avail,$snap_util)=get_df($orig_filer,$vol);
+my ($aggr,$vol_type,$vol_state,$vol_raid,$vol_bits,$vol_dedupe,$vol_snapmirrored)=get_vol_status($orig_filer,$vol);
+my ($aggr_state,$aggr_bit,$aggr_raid)=get_aggr_status($orig_filer,$aggr);
+my ($aggr_capacity,$aggr_used,$aggr_avail,$aggr_percent)=get_aggr_df($orig_filer,$aggr);
+my ($snap_percent,$snap_weekly,$snap_daily,$snap_hourly)=determine_vol_snap($orig_filer,$vol);
+my ($quota_used,$quota_capacity,$quota_files,$allocated_gb,$usuable_gb)=get_quota($orig_filer,$path,$vol_capacity,$snap_percent,$snap_capacity);
+my ($share)=cifs_shares($orig_filer,$vol,$qtree,$uri,$path);
+my ($cifs_change,$cifs_read,$cifs_full,$cifs_other,$cifs_comment,$cifs_unix)=cifs_access($orig_filer,$share) if ($orig_filer and $share);
+my ($export,$nfs_rw,$nfs_ro,$nfs_root,$nfs_comment)=exports($orig_filer,$vol,$qtree,$path);
+my $nfs_export_uri=lc get_fqdn($orig_filer).":$export" if($orig_filer and $export);
+#say "main share=>$share";
+my $cifs_share_uri="\\\\".uc get_fqdn($orig_filer)."\\$share" if($orig_filer and $share);
+#say "cifs_share_uri=>$cifs_share_uri";
+#say "orig_filer=>$orig_filer";
+my $bitmode=get_bitmode($real_filer,$vol,$qtree) unless ($sm_type and $sm_type=~/^Dest/);
+#push @snapmirrors,'###################  Snapmirror Info ############################' if %$snap_mirrors; 
+
+foreach my $dest(keys %$snap_mirrors){
+   push @snapmirrors,"sm_type=>$$snap_mirrors{$dest}{type}" if $$snap_mirrors{$dest}{type};
+   push @snapmirrors,"sm_source=>$$snap_mirrors{$dest}{source}" if $$snap_mirrors{$dest}{source};
+   push @snapmirrors,"sm_destination=>$dest";
+   push @snapmirrors,"sm_state=>$$snap_mirrors{$dest}{state}" if $$snap_mirrors{$dest}{state};
+   push @snapmirrors,"sm_lag=>$$snap_mirrors{$dest}{lag}" if $$snap_mirrors{$dest}{lag};
+   push @snapmirrors,"sm_status=>$$snap_mirrors{$dest}{status}" if $$snap_mirrors{$dest}{status};
+   my $sm_uris=get_sm_uris($dest,$$snap_mirrors{$dest}{type},$qtree);
+   push @snapmirrors,$_ foreach (@$sm_uris);
+   $hoa{Snapmirrors}=[@snapmirrors];
+}#foreach my $dest(keys %$snap_mirrors)
+#push @aggr,'################## Aggr Info ####################################';
+push @aggr,"aggr=>$aggr";
+push @aggr,"aggr_state=>$aggr_state" if $aggr_state;
+push @aggr,"aggr_raid=>$aggr_raid" if $aggr_raid;
+push @aggr,"aggr_bit=>$aggr_bit" if $aggr_bit;
+push @aggr,"aggr_capacity=>$aggr_capacity" if defined $aggr_capacity;
+push @aggr,"aggr_used=>$aggr_used" if defined $aggr_used;
+push @aggr,"aggr_avail=>$aggr_avail" if defined $aggr_avail;
+push @aggr,"aggr_utilized=>$aggr_percent" if defined $aggr_percent;
+$hoa{Aggr}=[@aggr];
+#push @vol,'################## Vol Info #####################################';
+push @vol,"vol=>$vol";
+push @vol,"vol_capacity=>$vol_capacity" if defined $vol_capacity;
+push @vol,"vol_used=>$vol_used" if defined $vol_used;
+push @vol,"vol_avail=>$vol_avail" if defined $vol_avail;
+push @vol,"vol_utilized=>$vol_percent" if defined $vol_percent;
+push @vol,"snap_capacity=>$snap_capacity" if defined $snap_capacity;
+push @vol,"snap_used=>$snap_used" if defined $snap_used;
+push @vol,"snap_avail=>$snap_avail" if defined $snap_avail;
+push @vol,"snap_utilized=>$snap_util" if defined $snap_util;
+push @vol,"vol_type=>$vol_type" if $vol_type;
+push @vol,"vol_state=>$vol_state" if $vol_state;
+#say "vol_raid=>$vol_raid" if $vol_raid;
+push @vol,"vol_bits=>$vol_bits" if $vol_bits;
+push @vol,"aggr=>$aggr" if $aggr;
+push @vol,"vol_dedupe=>$vol_dedupe" if $vol_dedupe;
+push @vol,"vol_snapmirrored=>$vol_snapmirrored" if $vol_snapmirrored;
+$hoa{Vol}=[@vol];
+#push @qtree,'################## Qtree Info ###################################';
+push @qtree,"qtree=>$qtree";
+push @qtree,"qtree_security=>$qtree_security" if defined $qtree_security;
+push @qtree,"qtree_oplocks=>$qtree_oplocks" if defined $qtree_oplocks;
+push @qtree,"qtree_sm=>$qtree_sm" if defined $qtree_sm;
+$hoa{Qtree}=[@qtree];
+#push @quota,'###################  Quota Info #################################' if $quota_capacity; 
+push @quota,"quota_capacity_gb=>$quota_capacity" if defined $quota_capacity;
+push @quota,"quota_used_gb=>$quota_used" if defined $quota_used;
+push @quota,"quota_files=>$quota_files" if defined $quota_files;
+$hoa{Quota}=[@quota] if @quota;
+#push @snapshot,'##################### Snapshot Info #############################' if defined $snap_percent;
+push @snapshot,"snap_reserve=>$snap_percent".'%' if defined $snap_percent;
+push @snapshot,"snap_weekly=>$snap_weekly" if defined $snap_weekly;
+push @snapshot,"snap_daily=>$snap_daily" if defined $snap_daily;
+push @snapshot,"snap_hourly=>$snap_hourly" if defined  $snap_hourly;
+$hoa{Snapshot}=[@snapshot] if @snapshot;
+#push @nfs,'##################### NFS Info ##################################' if $export;
+push @nfs,"NFS_export_path=>$export" if $export;
+push @nfs,"NFS_rw=>$nfs_rw" if $nfs_rw;
+push @nfs,"NFS_ro=>$nfs_ro" if $nfs_ro;
+push @nfs,"NFS_root=>$nfs_root" if $nfs_root;
+push @nfs,"NFS_comment=>$nfs_comment" if $nfs_comment;
+$hoa{NFS}=[@nfs] if @nfs;
+#push @cifs,'##################### CIFS Info #################################' if $share;
+push @cifs,"CIFS_share=>$share" if $share;
+push @cifs,"CIFS_change=>$cifs_change" if $cifs_change;
+push @cifs,"CIFS_read=>$cifs_read" if $cifs_read;
+push @cifs,"CIFS_full=>$cifs_full" if $cifs_full;
+push @cifs,"CIFS_comment=>$cifs_comment" if $cifs_comment;
+push @cifs,"CIFS_other=>$cifs_other" if $cifs_other;
+push @cifs,"CIFS_unix=>$cifs_unix" if $cifs_unix;
+$hoa{CIFS}=[@cifs] if @cifs;
+#push @key,'##################### Key Info ##################################'; 
+push @key,"Input=>$uri";
+push @key,"NFS_export_URI=>$nfs_export_uri" if($orig_filer and $export);
+push @key,"CIFS_share_URI=>$cifs_share_uri" if ($orig_filer and $share);
+push @key,"real_filer=>$real_filer" if $real_filer;
+push @key,"path=>$path" if defined $path;
+push @key,"snapmirror_type=>$sm_type" if $sm_type;
+push @key,"allocated_gb=>$allocated_gb" if defined $allocated_gb;
+push @key,"usuable_gb=>$usuable_gb" if defined $usuable_gb;
+push @key,"bitmode_perms=>$bitmode" if defined $bitmode;
+$hoa{Key}=[@key];
+
+my @order=qw(Aggr Vol Qtree Quota Snapshot Snapmirrors NFS CIFS Key);
+foreach my $header (@order) {
+   #say "################### $header Info $target_pad";
+   printf "%-37s","################### $header Info" if $hoa{$header};
+   say "#####################" if $hoa{$header};
+   foreach (@{$hoa{$header}}){
+      say $_;
+   }
+}
+   #say $_ foreach @aggr;
+   #say $_ foreach @vol;
+   #say $_ foreach @qtree;
+   #say $_ foreach @quota;
+   #say $_ foreach @snapshot;
+   #say $_ foreach @snapmirrors;
+   #say $_ foreach @nfs;
+   #say $_ foreach @cifs;
+   #say $_ foreach @key;
+   #say "mail_to=>$mail_to";
+   send_email if $mail_to;
+exit;
+##########################################################
+sub send_email{
+##########################################################
+   #say "in email";
+   my $rpt_object=Rpt->new;
+   $rpt_object->email_to($mail_to);
+   $rpt_object->email_subject("Map Uri=> $uri");
+   my @empty;
+   $rpt_object->MakeEmailBodyHeaders("map $uri",'',\@empty);
+
+   my @order=qw(Key CIFS NFS Snapmirrors Snapshot Quota Qtree Vol Aggr);
+   my @headers=qw(Label Value);
+   #say "before foreach";
+   foreach my $header (@order) {
+      next unless (@{$hoa{$header}});
+      #say "################### $header Info $target_pad";
+      my @status_header=("$header Info");
+      #say "$header Info";
+      $rpt_object->MakeEmailStatusHeaders('Red',\@status_header);
+      my @email_rpt;
+      foreach (@{$hoa{$header}}){
+         #say $_;
+         my @line=split /=>/,$_;
+         push @email_rpt,[@line];
+      }#foreach (@{$hoa{$header}})
+      $rpt_object->MakeEmailBody(\@headers,\@email_rpt);
+     #say "after email body";
+   }#foreach my $header @order
+#say "after foreach";
+   $rpt_object->SendEmail;
+   #say "email sent to $mail_to";
+}
+##########################################################
+sub get_aggr_status{
+##########################################################
+   my $filer=shift;
+   my $aggr=shift;
+   my ($aggr_state,$aggr_bit,$aggr_raid);
+   my $cmd="ssh $filer aggr status $aggr";
+   say $cmd if $debug;
+   my ($stdout,$stderr)=run_cmd $cmd;
+   if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+   }
+   foreach (@$stdout){
+      if (/^\s+$aggr\s+(\S+)\s+(\S+),\s+aggr/){
+         $aggr_state=$1;
+         $aggr_raid=$2;
+      }
+      $aggr_bit=$1 if (/^\s+(\d+-bit)/);
+   }
+   return($aggr_state,$aggr_bit,$aggr_raid);
+}
+##########################################################
+sub get_aggr_df{
+##########################################################
+   my $filer=shift;
+   my $aggr=shift;
+   my ($capacity,$used,$avail,$percent);
+   my $cmd="ssh $filer df -gA $aggr";
+   say $cmd if $debug;
+   my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+        #say $_;
+        #if (/^\/vol\/$_[1]\/\s+(\w+)\s+(\w+)\s(\w+)\s(\w+)/) {
+        #if (/^\/vol\/$_[1]\/\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/) {
+        if (/^$aggr\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/) {
+            $capacity=$1;
+            $used=$2;
+            $avail=$3;
+            $percent=$4;
+            #$capacity =~ s/GB//g;
+            #$used =~ s/GB//g;
+        }#end if
+   }#end foreach
+   return ($capacity,$used,$avail,$percent);
+}
+##########################################################
+sub get_qtree{
+##########################################################
+   my $filer=shift;
+   my $qtree=shift;
+   my $vol=shift;
+   my ($qtree_security,$qtree_oplocks,$qtree_sm);
+   my $cmd="ssh $filer qtree status $vol";
+   say $cmd if $debug;
+   my ($stdout,$stderr)=run_cmd $cmd;
+   if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+   }
+   foreach (@$stdout){
+      if (/$vol\s+$qtree\s+(\S+)\s+(\S+)\s+(\S+)/){
+         $qtree_security=$1;
+         $qtree_oplocks=$2;
+         $qtree_sm=$3;
+      }
+   }
+   return ($qtree_security,$qtree_oplocks,$qtree_sm);
+}
+##########################################################
+sub get_vol_status{
+##########################################################
+#my ($vol_type,$vol_vits,$vol_dedupe,$vol_snapmirrored)=get_vol_status($orig_filer,$vol);
+   my $filer=shift;
+   my $vol=shift;
+   my ($aggr,$vol_type,$vol_state,$vol_raid,$vol_bits,$vol_dedupe,$vol_snapmirrored);
+   my $cmd="ssh $filer vol status $vol";
+   say $cmd if $debug;
+   my ($stdout,$stderr)=run_cmd $cmd;
+   if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+   }
+   foreach (@$stdout){
+      #say $_;
+      if (/^$vol\s+(\S+)\s+(\S+),\s+(\S+)/){
+         $vol_state=$1;
+         $vol_raid=$2;
+         $vol_type=$3;
+      }
+      $vol_bits=$1 if (/^\s+(\d+-bit)/);
+      $aggr=$1 if (/^\s+Containing aggregate:\s+'(\S+)'/);
+      $vol_dedupe=$1 if (/^\s+sis$/);
+      $vol_snapmirrored=$1 if (/^\s+(snapmirrored)/);
+   }#end foreach @$stdout
+   return($aggr,$vol_type,$vol_state,$vol_raid,$vol_bits,$vol_dedupe,$vol_snapmirrored);
+}
+##########################################################
+sub get_bitmode{
+##########################################################
+   my $filer=shift;
+   my $vol=shift;
+   my $qtree=shift;
+   mount_vol($filer,$vol,$$);
+   my $cmd="/bin/ls -ln /var/tmp/$$/$filer/$vol";
+   say $cmd if $debug;
+   my ($stdout,$stderr)=run_cmd $cmd;
+   if (@$stderr){
+        say $_ foreach (@$stderr);
+        umount_vol($filer,$vol,$$);
+        return undef if (@$stderr);
+   }
+   umount_vol($filer,$vol,$$);
+   my $bitmode;
+   foreach (@$stdout){
+      #say "bitmode=>$_";
+      next if /^total/;
+      $bitmode=$_ if (/\s$qtree$/i);
+   }
+   return $bitmode;
+}
+##########################################################
+sub get_sm_uris{
+##########################################################
+   my $dest=shift;
+   my $type=shift;
+   my $qtree=shift;
+   my @sm_dest;
+   #say "dest=>$dest";
+   #say "type=>$type";
+   #say "qtree=>$qtree";
+   return undef unless ($type=~/Source/);
+   my ($dest_filer,$dest_path)=split /:/,$dest;
+   #say "dest_filer=>$dest_filer";
+   #say "dest_path=>$dest_path";
+   my $cmd="ssh $dest_filer cifs shares";
+   #say $cmd if $debug;
+   my ($stdout,$stderr)=run_cmd $cmd;
+   if (@$stderr){
+        say $_ foreach (@$stderr);
+        return undef;
+    }
+    foreach (@$stdout){
+       next if (/^\s/);
+       #say $_;
+       if ((/^([\S\$]+)\s+(\/vol\/$dest_path)[\s\/].*/i)or
+          (/^([\S\$]+)\s+($dest_path)\s.*/i)){
+          #say "dest_cifs_share=$1";
+          my ($cifs_change,$cifs_read,$cifs_full,$cifs_other,$cifs_comment)=cifs_access($dest_filer,$1);
+          push @sm_dest,"sm_CIFS_share_URI=>\\\\$dest_filer\\$1"; 
+          #say "sm_dest_CIFS_share_uri=>\\\\$dest_filer\\$1"; 
+          push @sm_dest,"sm_CIFS_share=>$1";
+          push @sm_dest,"sm_CIFS_change=>$cifs_change" if $cifs_change;
+          push @sm_dest,"sm_CIFS_read=>$cifs_read" if $cifs_read;
+          push @sm_dest,"sm_CIFS_full=>$cifs_full" if $cifs_full;
+          push @sm_dest,"sm_CIFS_comment=>$cifs_comment" if $cifs_comment;
+          push @sm_dest,"sm_CIFS_other=>$cifs_other" if $cifs_other;
+       }#if regex
+    }#foreach @$stdout
+    if (($dest=~ /:\/vol\/(\S+)\/(\S+)$/)or
+                      ($dest=~/:(\S+)$/)){#then VSM
+       my $dest_vol=$1;
+       my $dest_qtree=$2||$qtree;
+       my $dest_path="\/vol\/$dest_vol\/$dest_qtree";
+       my ($export,$nfs_rw,$nfs_ro,$nfs_root,$nfs_comment)=exports($dest_filer,$dest_vol,$dest_qtree,$dest_path);
+       push @sm_dest,"sm_NFS_export_URI=>$dest_filer:$export" if ($dest_filer and $export);
+       push @sm_dest,"sm_NFS_export_path=>$export" if $export;
+       push @sm_dest,"sm_NFS_rw=>$nfs_rw" if $nfs_rw;
+       push @sm_dest,"sm_NFS_ro=>$nfs_ro" if $nfs_ro;
+       push @sm_dest,"sm_NFS_root=>$nfs_root" if $nfs_root;
+       push @sm_dest,"sm_NFS_comment=>$nfs_comment" if $nfs_comment;
+    }
+    #say "sm_dest=>$_" foreach (@sm_dest);
+    return \@sm_dest;
+}
+##########################################################
+sub get_quota{
+##########################################################
+#my ($quota_used,$quota_capacity,$quota_files)=get_quota;
+   my $filer=shift;
+   my $path=shift;
+   my $vol_capacity=shift;
+   my $snap=shift;
+   my $snap_capacity=shift;
+   my ($quota_used,$quota_capacity,$quota_files);
+   my $cmd="ssh $filer quota report $path";
+   print "quota report cmd => $cmd\n" if $debug;
+   my ($stdout,$stderr)=run_cmd $cmd;
+   if (@$stderr){
+       foreach (@$stderr){
+          say $_;
+          $quota_capacity=$1 if (/^quota: (quotas are off.+)/);
+       }
+       #exit 1 unless (/^quota: (quotas are off.+)/);
+       exit 1 unless (grep /quotas are off/,@$stderr);
+   }#end if @stderr
+   foreach (@$stdout){
+      #say $_;
+      $quota_capacity=$1 if (/^quota: (quotas are off.+)/);
+      if (/\S+\s+\d+\s+[\S_]+\s+[\S_]+\s+(\d+)\s+(\d+)\s+(\d+)/){
+         $quota_used=$1;
+         $quota_used=(($quota_used/1024)/1024);
+         $quota_capacity=$2;
+         $quota_capacity=(($quota_capacity/1024)/1024);
+         $quota_files=$3;
+      }
+   }
+#say "q_capacity=>$quota_capacity";
+#say "snap=>$snap_percent";
+$vol_capacity=~s/GB//g;
+$snap_capacity=~s/GB//g;
+#say "vol_capacity $vol_capacity snap_capacity $snap_capacity";exit;
+my $usuable_gb=$vol_capacity;
+$usuable_gb=$quota_capacity if ($quota_capacity=~/^[\d\.]+$/);
+my $allocated_gb=$vol_capacity+$snap_capacity;
+if (($quota_capacity=~/^\d+$/) and $snap_percent){
+   $allocated_gb=$quota_capacity*("1.".$snap_percent); 
+}
+$allocated_gb=$quota_capacity if ($quota_capacity=~/^[\d\.]+$/ and ! $snap_percent);
+$allocated_gb=sprintf "%.2f",$allocated_gb if ($allocated_gb and $allocated_gb=~/^d+$/);
+$quota_used=sprintf "%.2f",$quota_used if ($quota_used and $quota_used=~/^[\d\.]+$/);
+$quota_capacity=sprintf "%.2f",$quota_capacity if ($quota_capacity and $quota_capacity=~/^[\d\.]+$/);
+$allocated_gb=~s/\.00//g if defined $allocated_gb;
+$quota_used=~s/\.00//g if defined $quota_used;
+$quota_capacity=~s/\.00//g if defined $quota_capacity;
+
+#$allocated_gb.='GB' if ($allocated_gb and $allocated_gb=~/^[\d\.]+$/);
+#$quota_used.='GB' if ($quota_used and $quota_used=~/^[\d\.]+$/);
+#$quota_capacity.='GB' if ($quota_capacity and $quota_capacity=~/^[\d\.]+$/);
+#$usuable_gb.='GB' if ($usuable_gb and $usuable_gb=~/^[\d\.]+$/);
+#say "snap=>$snap_percent" if ($snap_percent);
+#say "quota_used=>$quota_used" if defined $quota_used;
+#say "quota_capacity=>$quota_capacity" if defined $quota_capacity;
+#say "quota_files=>$quota_files" if defined $quota_files;
+#say "allocated_gb=>$allocated_gb" if defined $allocated_gb;
+#say "usuable_gb=>$quota_capacity" if ($quota_capacity=~/^\d+$/);
+#exit;
+#say "quota_capacity=>$quota_capacity" if $quota_capacity;
+#say "allocated_gb=".$quota_capacity*$snap_percent if ($quota_capacity and $snap_percent);
+#say "usuable_gb=>$quota_capacity" if ($quota_capacity);
+   return ($quota_used,$quota_capacity,$quota_files,$allocated_gb,$usuable_gb);
+}
+##########################################################
+sub determine_vol_snap{
+##########################################################
+   #print "determine_vol_snap...";
+   my $filer=shift;
+   my $vol=shift;
+   my ($weekly,$daily,$hourly);
+    my $cmd="ssh $filer snap reserve $vol"; 
+    print "determine_vol_snap cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+       if (/current snapshot reserve is (\S+)/){
+          $snap_percent=$1;
+          $snap_percent=~s/%//g;
+       } 
+    }
+    $cmd="ssh $filer snap sched $vol"; 
+    print "determine_vol_snap cmd => $cmd\n" if $debug;
+    ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+       #say $_;
+       if (/^Volume\s+$vol:\s+(\S+)\s+(\S+)\s+(\S+)/){
+         $weekly=$1;
+         $daily=$2;
+         $hourly=$3;
+       }
+    }
+  #say "snap_percent $snap_percent%";
+  #say "weekly=>$weekly daily=>$daily hourly=>$hourly";
+  return $snap_percent,$weekly,$daily,$hourly;
+}
+##########################################################
+sub determine_uri{
+##########################################################
+#my ($srdb_comp,$uri,$orig_filer,$remains)=determine_uri($_);
+    my $inline=shift;
+    #print "determine uri..."; 
+    my $field_count=count_fields($inline);
+    if ($field_count > 1 ){
+       say "ERROR:More then 1 fields detected in $inline,aborting";
+       exit;;
+    }
+    my $comp=my $uri =' ';
+    my ($cifs_type,$nfs_type);
+    if ($inline =~ /\\/) {
+       $cifs_type=1;
+       say "CIFS URI type..." if $debug;
+    } elsif ($inline =~ /\//) {
+       $nfs_type=1;
+       say "NFS URI type..." if $debug;
+    } else { 
+       say "CIFS or NFS style URI not detected";
+       exit 1;
+    }
+    my ($discard2,$orig_filer,$remains);
+    ($orig_filer,$remains)=split /:/,$inline if $nfs_type;
+    if ($cifs_type) {
+       if ( $inline=~ /^\\\\(\S+)\\(\S+)/){
+          $orig_filer=$1;
+          $remains=$2;
+       } 
+    }
+    unless ($orig_filer and $remains){
+       say "Unable to determine original filer name or remaining URI";
+       exit 1;
+    }
+    say "orig_filer=>$orig_filer remains=$remains" if $verbose;
+    return($orig_filer,$remains);
+}
+##########################################################
+sub determine_vol_qtree{
+##########################################################
+   my $filer=shift;
+   my $remains=shift;
+   my $vol="NA";
+   my $qtree="NA";
+   my $path="NA";
+   #print "determine vol qtree...";
+   #say "\nin determine_vol_qtree remains=>$remains"; exit;
+   if ($remains =~ /^\/vol\/(\S+)\/(\S+)\/.*/i) {
+       #NFS path goes beyond qtree
+       $vol=$1;$qtree=$2;$path=$remains;
+       print "vol=>$vol qtree=>$qtree path=$path\n" if $verbose;
+       return $vol,$qtree,$path;
+   }
+   if ($remains =~ /^\/vol\/(\S+)\/(\S+).*/i) {
+       #NFS path ends with qtree
+       $vol=$1;$qtree=$2;$path=$remains;
+       print "vol=>$vol qtree=>$qtree path=$path\n" if $verbose;
+       return $vol,$qtree,$path;
+   }
+   if ($remains =~ /^(\S+).*/i) {
+       my $SHARE=$1;
+       #say "Cifs, need to find vol/qtree for $SHARE";
+       my $cmd="ssh $filer cifs shares $SHARE"; 
+       print "detemine_vol_qtree CIFS cmd => $cmd\n" if $debug;
+       my ($stdout,$stderr)=run_cmd $cmd;
+       if (@$stderr){
+           say "ERROR STDERR determine_vol_qtree:$filer $remains:$_" foreach (@$stderr);
+           exit 1;
+       }
+       $SHARE=~s/\$/\\\$/gi ;
+       foreach (@$stdout){
+          if (/^$SHARE\s+\/vol\/(\w+)\/(\w+)/i){
+             $vol=$1;$qtree=$2;
+             if (/^$SHARE\s+(\S+)\s+/i){
+                $path=$1;
+             }
+             print "vol=>$vol qtree=>$qtree path=$path\n" if $verbose;
+             return $vol,$qtree,$path;
+          }
+       }#end for each @$stdout
+       print "vol=>$vol qtree=>$qtree path=>$path" if $debug;
+       return ($vol,$qtree,$path);
+    }#end if $uri 
+} #end sub
+##########################################################
+sub quota_report{
+##########################################################
+    my $qvol=$_[1];
+    my $qqtree=$_[2];
+    my $quota_use="NA";
+    my $quota_limit="NA";
+    my $quota_files="NA";
+    print "quota_report...";
+    #my $cmd="ssh $_[0] quota report|grep \"/vol/$qvol/$qqtree\$\"";
+    my $cmd="ssh $_[0] quota report|grep -P \" $qvol\\s+$qqtree \"";
+    print "quota report cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+       #print "QUOTA OUT=>$_\n";
+       #my @line=split / /,$_;
+       #if (/^\w+\s+\w+\s+\w+\s+\w+\s+(\w+)\s+(\w+)\s(\w+)/){
+       if (/^\S+\s+\S+\s+\S+\s+\S+\s+(\w+|-)\s+(\w+|-)\s+(\w+|-)\s+/){
+           $quota_use=$1;
+           $quota_limit=$2;
+           $quota_files=$3;
+       }
+       print "quota_use=>$quota_use quota_limit=>$quota_limit quota_files=>$quota_files\n" if $debug;
+    }
+    print "$quota_use $quota_limit $quota_files\n" if $verbose; 
+    return($quota_use,$quota_limit,$quota_files);
+    
+}
+##########################################################
+sub exports{
+##########################################################
+    #print "exports..."; 
+    my $filer=$_[0];
+    my $evol=$_[1];
+    my $eqtree=$_[2];
+    my $eqpath=$_[3];
+    my ($export_path,$nfs_rw,$nfs_ro,$nfs_root,$nfs_comment);
+    my $cmd="ssh $filer exportfs -q $eqpath";
+    print "exports cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    #say "eqpath=>$eqpath";
+    foreach (@$stdout){
+       say $_ if $debug;
+       $export_path=$1 if (/^($eqpath)\s/);
+       $nfs_rw=$1 if (/^$eqpath\s.+rw=([\@a-zA-Z0-9\-\.:_]+)/);
+       $nfs_ro=$1 if (/^$eqpath\s.+ro=([\@a-zA-Z0-9\-\.:_]+)/);
+       $nfs_root=$1 if (/^$eqpath\s.+root=([\@a-zA-Z0-9\-\.:_]+)/);
+    }#end foreach @$stdout
+    #say "EXPORT=>$export_path";
+    #say "nfs_rw=>$nfs_rw";
+    #say "nfs_root=>$nfs_root";
+    $cmd="ssh $filer rdfile /etc/exports|grep -P \"^$eqpath\\s\+\"";
+    ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+        #say "exports_comment=>$_";
+        $nfs_comment=$1 if (/.+#{1}(.*)#?$/)
+    }
+       #say "nfs_comment=>$nfs_comment" if $nfs_comment;
+    return($export_path,$nfs_rw,$nfs_ro,$nfs_root,$nfs_comment);
+}
+##########################################################
+sub cifs_access{
+##########################################################
+    my $filer=shift;
+    my $share=shift;
+    my ($change,$read,$full,$no,$comment,$unix);
+    my $cmd="ssh $filer cifs shares $share";
+    print "exports cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+     #say $_;
+      next if /^Name/;
+      next if /^----/;
+      $comment.="$1 " if (/^[\S\$]+\s+\S+\s(.+)/);
+      $change.="$1 " if (/^\s+(.+)\s\/\sChange/);
+      $read.="$1 " if (/^\s+(.+)\s\/\sRead/);
+      $full.="$1 " if (/^\s+(.+)\s\/\sFull\sControl/);
+      $no.="$1 " if (/^\s+(\*\*\s.+access.+\s\*\*)/);
+      $unix.="$1=$2 " if (/\s+(.+)\s\/\s([rwx-][rwx-][rwx-])/);
+    
+    }
+   $comment=~s/\s+$//g if $comment;
+   $change=~s/\s+$//g if $change;
+   $read=~s/\s+$//g if $read;
+   $full=~s/\s+$//g if $full;
+   $no=~s/\s+$//g if $no;
+   $unix=~s/\s+$//g if $unix;
+   return ($change,$read,$full,$no,$comment,$unix);
+   
+}
+##########################################################
+sub cifs_shares{
+##########################################################
+    #print "cifs..."; exit;
+    my $filer=$_[0];
+    my $cvol=$_[1];
+    my $cqtree=$_[2];
+    my $uri=$_[3];
+    my $path=$_[4];
+    my $cifs_vol_share=" ";
+    my $cifs_qtree_share=" ";
+    my $cifs_path_share=" ";
+    my $cmd="ssh $filer cifs shares";
+    print "cifs_shares cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        return if (grep /CIFS not running/i,@$stderr);
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    
+    print "searching cifs for vol=>$cvol qtree=>$cqtree path=>$path\n" if $debug;
+    my $cshare;
+    foreach (@$stdout){
+       next if (/^\s/);
+       #"considering=>$_" if $debug;
+       if (/^([\S\$]+)\s+\/vol\/$cvol\s/){
+          #$cifs_vol_share="vol";
+          $cifs_vol_share=$1;
+          $cshare=$cifs_vol_share;
+          print "cifs_vol_share=>$cifs_vol_share\n" if $debug;
+          next;
+       }
+       if (/^([\S\$]+)\s+\/vol\/$cvol\/$cqtree(\s|$)/){
+          #$cifs_qtree_share="qtree";
+          $cifs_qtree_share=$1;
+          $cshare=$cifs_qtree_share;
+          print "### cifs_qtree_share=>$cifs_qtree_share\n" if $debug;
+          print "### share=>$cshare\n" if $debug;
+          next;
+       }
+       if (/^([\S\$]+)\s+$path(\s|$)/){
+          #$cifs_path_share="path";
+          $cifs_path_share=$1;
+          $cshare=$cifs_path_share;
+          print "!!! cifs_path_share=>$cifs_path_share\n" if $debug;
+          next;
+       }
+    }
+    #my $share=$cifs_vol_share.$cifs_qtree_share.$cifs_path_share;
+    $cshare=~s/\s+//g if $cshare;
+    print "search over... cifs for vol=>$cvol qtree=>$cqtree \n" if $debug;
+    #print ">$cifs_vol_share< >$cifs_qtree_share< $cifs_path_share\n" ; 
+    #say ">$cshare<";
+    return ($cshare);
+}
+##########################################################
+sub get_df{
+##########################################################
+    my $filer=shift;
+    my $vol=shift;
+    my $cmd="ssh $filer df -g $vol";
+    #print "df..."; 
+    print "get_df cmd => $cmd\n" if $debug;
+    my ($capacity,$used,$avail,$percent,$snap_capacity,$snap_used,$snap_avail,$snap_util);
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+        #say $_;
+        #if (/^\/vol\/$_[1]\/\s+(\w+)\s+(\w+)\s(\w+)\s(\w+)/) {
+        #if (/^\/vol\/$_[1]\/\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/) {
+        if (/^\/vol\/$vol\/\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/) {
+            $capacity=$1;
+            $used=$2;
+            $avail=$3;
+            $percent=$4;
+            #$capacity =~ s/GB//g;
+            #$used =~ s/GB//g;
+        }#end if 
+        if (/^\/vol\/$vol\/.snapshot\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/) {
+            $snap_capacity=$1;
+            $snap_used=$2;
+            $snap_avail=$3;
+            $snap_util=$4;
+        }#end if 
+        
+    }#end if @$stdout;
+    #say "capacity=>$capacity used=>$used" if $debug;
+    #say "avail=>$avail percent=>$percent" if $debug;
+    #say "snap_capacity=>$snap_capacity used=>$snap_used" if $debug;
+    #say "snap_avail=>$snap_avail snap_util=>$snap_util" if $debug;
+    return ($capacity,$used,$avail,$percent,$snap_capacity,$snap_used,$snap_avail,$snap_util);
+}
+##########################################################
+sub get_snapmirror{
+##########################################################
+    #print "snapmirror...\n"; 
+    my $filer=shift;
+    my $vol=shift;
+    my $path=shift;
+    my (%snap_mirror_vol_dests,%snap_mirror_vol_sources);
+    my (%snap_mirror_qtree_dests,%snap_mirror_qtree_sources);
+    my (%snap_mirror_dests,%snap_mirror_sources);
+    my (%snap_mirrors);
+    #look for vol snapmirror first
+    my $cmd="ssh $filer \"snapmirror status $vol;snapmirror status $path\"";
+    say $cmd if $debug;
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+       if (/:$vol\s+/i or /:$path\s+/i){
+          print "$_\n" if $debug;
+          #say $_;
+          if (/(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/){
+             $snap_mirrors{$2}{source}=$1;#$2 is dest
+             $snap_mirrors{$2}{state}=$3;
+             $snap_mirrors{$2}{lag}=$4;
+             $snap_mirrors{$2}{status}=$5;
+             
+          }#inner regex
+       }#outer regex
+    }#foreach @$stdout
+    #say "############################################";
+    foreach my $dest(keys %snap_mirrors){
+        my ($source_filer,$source_path)=split /:/,$snap_mirrors{$dest}{source};
+        my ($dest_filer,$dest_path)=split /:/,$dest;
+        #say "vol=>$vol source_path=>$source_path";
+        #say "vol=>$vol dest_path=>$dest_path";
+        #say "path=>$path source_path=>$source_path";
+        #say "path=>$path dest_path=>$dest_path";
+        if (($vol =~ /^$source_path$/i)&&($snap_mirrors{$dest}{state} eq 'Source')){
+            $snap_mirrors{$dest}{type}.="Source_VSM"; 
+        }
+        if (($vol =~ /^$dest_path$/i)&&($snap_mirrors{$dest}{state} ne 'Source')){
+            $snap_mirrors{$dest}{type}.="Destination_VSM";
+        }
+        #$snap_mirrors{$dest}{type}.="Destination_VSM" if ($vol =~ /^$dest_filer:$dest_path$/i);
+        $snap_mirrors{$dest}{type}.="Source_QSM" if ($path =~ /^$source_path$/i);
+        $snap_mirrors{$dest}{type}.="Destination_QSM" if ($path =~ /^$dest_path$/i);
+        if ($snap_mirrors{$dest}{type}){
+           if ($sm_type){
+              $sm_type.=" AND $snap_mirrors{$dest}{type}" 
+           }else 
+              {$sm_type=$snap_mirrors{$dest}{type}; 
+           }
+        }
+        $snap_mirrors{$dest}{source_filer}=$source_filer;
+        $snap_mirrors{$dest}{source_path}=$source_path;
+        $snap_mirrors{$dest}{dest_filer}=$dest_filer;
+        $snap_mirrors{$dest}{dest_path}=$dest_path;
+        #say "path $path";
+        #say "vol $vol";
+        #say "dest $dest";
+        #say "source $snap_mirrors{$dest}{source}";
+        #say "state $snap_mirrors{$dest}{state}";
+        #say "lag $snap_mirrors{$dest}{lag}";
+        #say "status $snap_mirrors{$dest}{status}";
+        #say "source_filer $source_filer";
+        #say "source_path $source_path";
+        #say "dest_filer $dest_filer";
+        #say "dest_path $dest_path";
+        #say "type $snap_mirrors{$dest}{type}";
+        
+    }#end foreach my $dest (keys %snap_mirrors){
+    return \%snap_mirrors;
+}
+##########################################################
+
+
+=cut
+    my (@qtree_dests,@vol_dests,@qtree_sources,@vol_sources);
+    my $cmd="ssh $filer snapmirror status";
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+       #print "$_\n";
+       if (/^$filer:\/vol\/$vol\/$qtree\s+(\S+)/){
+          say "Qtree snapmirror dest $1"  if $verbose;
+          my ($qdest_filer,$qleft)=split /:/,$1;
+          if (mirror_state("$filer:/vol/$vol/$qtree",$qdest_filer,$1)){
+              push @qtree_dests,$1;
+          }
+          next;
+       }
+       if (/^$filer:$vol\s+(\S+)/){
+          say "Vol snapmirror dest $1" if $verbose;
+          my ($dest_filer,$left)=split /:/,$1;
+          say " dest filer>$dest_filer dest->$1" if $verbose;
+          if (mirror_state("$filer:$vol",$dest_filer,$1)){
+             push @vol_dests,$1; 
+          }
+       }
+       if (/^(\S+:\S+)\s+$filer:$vol\s+Snapmirrored/){
+          say "Vol snapmirror source $1" if $verbose;
+          push @vol_sources,$1;
+       }
+       if (/^(\S+:\S+)\s+$filer:\/vol\/$vol\/$qtree\s+Snapmirrored/){
+          say "Qtree snapmirror source $1" if $verbose;
+          push @qtree_sources,$1;
+       }
+    }#end foreach @$stdout
+    #if ($verbose){ print "$_ " foreach (@vol_dests);}
+    #if ($verbose){ print "$_ " foreach (@qtree_dests);}
+    #if ($verbose){ print "$_ " foreach (@vol_sources);}
+    return (\@vol_dests,\@qtree_dests,\@vol_sources,\@qtree_sources);
+}
+=cut
+##########################################################
+sub mirror_state{
+##########################################################
+   my $source=shift;
+   my $dest_filer=shift;
+   my $dest=shift;
+   my $cmd="ssh $dest_filer snapmirror status $dest";
+   my ($nstdout,$nstderr)=run_cmd $cmd;
+   if (@$nstderr){
+      say $_ foreach (@$nstderr);
+      exit 1;
+   }
+   #print "\nsearching for $dest\n";
+   foreach my $dest_line (@$nstdout){
+      #print "$dest_line\n" ;
+      if ($dest_line=~/.+$dest\s+(\S+)/){
+         print "dest $dest state->$1\n" if ($1 and $verbose);
+         unless ($1 eq 'Snapmirrored'){
+             #push @warn_rpt,["snapmirror $source $dest","Broken-off"];
+             return undef;
+         }#unless $state
+      }#if $dest_line
+   }#foreach my @dest_line
+   return 1;
+}
+##########################################################
+sub real_filer_name{
+##########################################################
+    #print "real filer..."; 
+    my $cmd="ssh @_ hostname";
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    #say $_ foreach (@$stdout);
+    my $real_name=$$stdout[0];
+    #$real_name=get_fqdn($real_name);
+    print "$real_name\n" if $verbose;
+    return $real_name;
+}
+##########################################################
+sub count_fields{
+##########################################################
+# Count and return the number of fields in a string.
+# The fields delimiter to be white space.
+    my $string=shift; 
+    no warnings;
+    my $count= scalar split /\s+/,$string;
+    return $count;
+}
+##########################################################

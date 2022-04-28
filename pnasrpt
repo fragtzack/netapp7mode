@@ -1,0 +1,544 @@
+##########################################################
+# pnasrpt
+# nas provision report for a full srdb(default) or specified comps(s)
+#Michael.S.Denney@gmail.com
+my $VERSION=1.01;
+##########################################################
+#TO DO:
+#       multiple tabs for excel spreadsheet
+#Version history
+#  1.01 added --comp
+##########################################################
+use strict;
+use Data::Dumper;
+use Getopt::Long;
+use Time::Local;
+use Env;
+use DBI;
+use File::Copy;
+use Rpt;
+use Common;
+use Netapp;
+#######ARGV command line variables get opts###################
+my $verbose=0;my $debug=0;my $mail_to;my $mail_to_cmd;
+my $open=0;my $closed=0;my $srdb_num=0;my $rptflag=1;
+my @comps;
+my ($print_sql,$print_html,$dev,$silent,$lob);
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path=$base."log";
+my $log_file=$log_path."/$script.log";
+my $err_log=$log_path."/$script.err_log";
+exit unless GetOptions(
+          's|srdb=i' => \$srdb_num,
+          'silent' => \$silent,
+          'v' => \$verbose,
+          'd' => \$debug,
+          'm=s' => \$mail_to_cmd,
+          'sql' => \$print_sql,
+          'html' => \$print_html,
+          'comp=s' => \@comps,
+          'dev' => \$dev
+);
+##################Global VARS#################################
+use vars qw(@rpt @error_rpt @mail_rpt @rpt_headers $mail_to);
+use vars qw(@html_files);
+use vars qw (%formats %arrays @email_rpt $nexus $srdb);
+#rpt_file,lob_file and excel_file are the tmp files created
+my $excel_file="/tmp/pnasrpt.xls";
+##################Predeclare SUBS#############################
+use subs qw(map_Additional_Comp_Info select_query );
+use subs qw(from_query where_query order_query send_email);
+use subs qw(usage mapuri create_html zip_em);
+use subs qw(map_lun_security map_luns_carved map_zone_request);
+use subs qw(rpt_headers file_copies);
+##############SANITY CHECKS AND PREPS#########################
+$ENV{LIBRARY_PATH}='/usr/local/lib';
+##############################################################
+usage unless ($srdb_num);
+my $srdb_dir="$base/var/srdb/$srdb_num";
+#say "srdb_dir=>$srdb_dir";exit;
+my $netapp=Netapp->new;
+$verbose=1 if ($debug);
+###########################################################################
+$Netapp::srdb_comp="$srdb_num.0";
+slogit "INFO Searching srdb for $srdb_num";
+$mail_to=$mail_to_cmd if ($mail_to_cmd);
+#unless ($mail_to) {say "Unable to determine email recipient. aborting";exit 1;}
+$mail_to='michael.denney@bankofamerica.com' unless $mail_to;
+say "mail_to=>$mail_to" if $verbose;
+
+
+
+
+my $data_source='ODBC:SRDB';
+my $username='TechwebRead';
+my $auth='techweb1read';
+
+my $dbh = DBI->connect('dbi:ODBC:SRDB',$username,$auth,{ RaiseError => 1, AutoCommit => 0 });
+unless ($dbh){
+  print "Failed to connect\n";
+  exit 1;
+}
+
+my $select_query=select_query;
+my $from_query=from_query;
+my $where_query=where_query;
+my $order_query=order_query;
+my $query=$select_query.$from_query.$where_query.$order_query;
+if ($print_sql) {
+    say $query;
+    exit;
+}
+
+my $sth = $dbh->prepare($query);
+$sth->{LongReadLen}=4048;
+my $rv = $sth->execute;
+unless ($rv) {
+  print ERROR with sql-> $dbh->errstr."\n";
+  exit 1;
+}
+
+my $row_cnt=0;
+ while (my $ref = $sth->fetchrow_hashref) {
+   #next unless ($$ref{Comp}==18);
+   #foreach (keys %$ref){
+      #print "$_=>$$ref{$_}\n" 
+   #}
+   #unless ($ref->{'Additional_Comp_Info'}){
+       #print $ref->{'SRDB.Comp'}."\n";
+       #say "EXIT";exit;
+   #}
+   #my $add_info=map_Additional_Comp_Info($$ref{'Additional_Comp_Info'});
+   say "#########$$ref{SRDB}.$$ref{Comp}#########";
+   $Netapp::srdb_comp="$srdb_num.$$ref{Comp}";
+   my $uri=map_lun_security($$ref{lun_security});
+   say "URI=>$uri";
+   #say "undefined" unless $uri;next;
+   #my $carved=map_luns_carved($$ref{luns_carved}) unless $uri;
+   #print Dumper(%$comp_info_hash);
+   $srdb=$$ref{SRDB};
+   $nexus=$$ref{Nexus};
+   $row_cnt++;##first row is header, so increment before add to @rpt
+   my ($hoh,$hoa)=mapuri($uri);
+   next unless ($hoh and $hoa);
+   my $html_file=create_html($$ref{Comp},$hoa) if $hoa;
+   push @html_files,$html_file if $html_file;
+   #say "html_file => $html_file"; exit;
+   #next;
+   my $security;
+              #say "mapuri_nfs=>$$hoh{Key}{NFS_export_URI}";
+              #say "mapuri_cifs=>$$hoh{Key}{CIFS_share_URI}";
+   push @rpt,[
+              $$ref{Comp}||' ',
+              $$ref{Comp_Status}||' ',
+              $$ref{'Comp Provision'}||' ',
+              $$hoh{Key}{allocated_gb}||' ',
+              $$hoh{Key}{usuable_gb}||' ',
+              $$hoh{Key}{NFS_export_URI}||' ',
+              $$hoh{Key}{CIFS_share_URI}||' ',
+              $$hoh{NFS}{NFS_export_path}||' ',
+              $$hoh{NFS}{NFS_rw}||' ',
+              $$hoh{NFS}{NFS_ro}||' ',
+              $$hoh{NFS}{NFS_root}||' ',
+              $$hoh{NFS}{NFS_comment}||' ',
+              $$hoh{CIFS}{CIFS_share}||' ',
+              $$hoh{CIFS}{CIFS_change}||' ',
+              $$hoh{CIFS}{CIFS_read}||' ',
+              $$hoh{CIFS}{CIFS_full}||' ',
+              $$hoh{CIFS}{CIFS_comment}||' ',
+              $$hoh{CIFS}{CIFS_other}||' ',
+              $$hoh{CIFS}{CIFS_unix}||' ',
+              $$hoh{Key}{bitmode_perms}||' ',
+              $$hoh{Snapmirrors}{sm_type}||' ',
+              $$hoh{Snapmirrors}{sm_source}||' ',
+              $$hoh{Snapmirrors}{sm_destination}||' ',
+              $$hoh{Snapshot}{snap_reserve},
+              $$hoh{Snapshot}{snap_weekly},
+              $$hoh{Snapshot}{snap_daily},
+              $$hoh{Snapshot}{snap_hourly}
+             ];
+             push @email_rpt,[
+              $$ref{Comp}||' ',
+              $$ref{Comp_Status}||' ',
+              $$hoh{Key}{usuable_gb}||' ',
+              $$hoh{Key}{NFS_export_URI}||' ',
+              $$hoh{Key}{CIFS_share_URI}||' '
+             ];
+   my @email_headers=('Comp','Status','Useable GB','NFS URI','CIFS URI');
+            #next unless ($$ref{'SRDB.Comp'} =~ /12078\.1/);
+ }#end while my $ref = $sth->fetchrow_hashref
+
+$sth->finish;
+$dbh->rollback;
+$dbh->disconnect;
+#exit;
+my $zip_file=zip_em(\@html_files) if @html_files;
+send_email if ($mail_to and @email_rpt);
+exit;
+file_copies;
+exit;
+###########################################################################
+sub zip_em{
+###########################################################################
+   my $zip_files=shift;
+   my $zip_file="$srdb_dir/$srdb_num.zip";
+   my $cmd="/usr/bin/zip $zip_file ";
+   foreach (@$zip_files){
+     say $_;
+     $cmd.="$_ ";
+   }
+    my ($stdout,$stderr)=run_cmd $cmd;
+    say "run_cmd=>$cmd" if $debug;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    foreach (@$stdout){
+       #say $_;
+    }
+    return $zip_file;
+}
+###########################################################################
+sub create_html{
+###########################################################################
+   my $comp=shift;
+   my $hoa=shift;
+   my $rpt_object=Rpt->new;
+   my @empty;
+   #print Dumper(%$hoa);exit;
+   $rpt_object->MakeEmailBodyHeaders("Srdb $srdb_num Comp $comp",'',\@empty);
+
+   my @order=qw(Key CIFS NFS Snapmirrors Snapshot Quota Qtree Vol Aggr);
+   my @headers=qw(Label Value);
+    foreach my $header (@order) {
+        next unless ($$hoa{$header});
+        #say "#### $header ###";
+        my @status_header=("$header Info");
+        $rpt_object->MakeEmailStatusHeaders('Red',\@status_header);
+        my @email_rpt;
+        foreach (@{$$hoa{$header}}){
+            #print "$_ " foreach (@$_);
+            #print "\n";
+            push @email_rpt,[@$_];
+        }
+        #print Dumper(@email_rpt);
+        $rpt_object->MakeEmailBody(\@headers,\@email_rpt);
+    }
+    my $html_file="$srdb_dir/comp_$comp.html";
+    open FH,">$html_file" or die "unable to open $html_file:$!\n";
+    print FH $rpt_object->email;
+    close FH;
+    return $html_file;
+
+}
+###########################################################################
+sub mapuri{
+###########################################################################
+    my $uri=shift;
+    my $cmd="mapuri --uri \'$uri\'";
+    say $cmd if $debug;
+    my ($stdout,$stderr)=run_cmd $cmd;
+    if (@$stderr){
+        say $_ foreach (@$stderr);
+        exit 1;
+    }
+    my (@category,%category,%hoa,%hoh);
+    foreach (reverse @$stdout){
+       say $_ if $debug;
+       if (/^#+\s+(\S+)\s+Info\s/){
+            #say "Category=$1";
+            $hoh{$1}={%category};
+            $hoa{$1}=[reverse @category];
+            undef %category;undef @category;
+            next;
+       }
+       my @line=split /=>/,$_;
+       $category{$line[0]}=$line[1];
+       push @category,[$line[0],$line[1]];
+    }
+=cut
+    my @order=qw(Key CIFS NFS Snapmirrors Snapshot Quota Qtree Vol Aggr);
+    foreach my $header (@order) {
+        say "#### $header ###";
+        foreach (keys %{$hoh{$header}}){
+            print "$_  ==>> $hoh{$header}{$_}\n" 
+        }
+    }
+    foreach my $header (@order) {
+        say "#### $header ###";
+        foreach (@{$hoa{$header}}){
+            print "$_ " foreach (@$_);
+            print "\n";
+        }
+    }
+=cut
+    #foreach (@{$hoa{$header}}){
+         ##say $_;
+         #my @line=split /=>/,$_;
+         #push @email_rpt,[@line];
+      #}#foreach (@{$hoa{$header}})
+
+   return undef unless(%hoh and %hoa);
+   return (\%hoh,\%hoa);
+}
+###########################################################################
+sub map_luns_carved{
+###########################################################################
+   my %luns;
+   my @lines=split /\n/,$_[0];
+   foreach (@lines){
+      chomp $_;
+      #say $_;
+      if (/tree\s+\d+\s+(\S+)\s+(\S+)\s+\d+\s+(\d+)/){
+         #say $_;
+         $luns{vol}=$1;
+         $luns{qtree}=$2;
+         $luns{quota}=$3/1024/1024;
+         #my $quota=$3/1024/1024;
+         #say "Quota=>$quota";
+      }
+   }
+   #print "$_=>$luns{$_} " foreach (keys %luns);print "\n";
+   return \%luns;
+}
+###########################################################################
+sub map_lun_security{
+###########################################################################
+##goal here is to find a single NAS URI
+   my %security;
+   my @lines=split /\n/,$_[0];
+   foreach (@lines){
+      chomp $_;
+      #say "line=>$_";#next;
+      if (/(\S+:\/vol\/\S+\/\S+)(\s|$)/){
+         #print "nfs_uri=>$1\n";
+         return $1;
+      }
+      if (/(\\\\\S+\\\S+)(\s|$)/){
+         #print "cifs_uri=>$1\n";
+         return $1;
+      }
+   }#end foreach @lines
+   return undef;
+}
+###########################################################################
+sub send_email{
+###########################################################################
+#say "sending email";
+   my @rpt_headers=rpt_headers;
+   my $rpt_object=Rpt->new;
+=cut
+   $formats{'all'}{1}{'width'}=9.5;
+   $formats{'all'}{2}{'width'}=8.5;
+   $formats{'all'}{3}{'width'}=9.8;
+   $formats{'all'}{4}{'width'}=10.5;
+   $formats{'all'}{5}{'width'}=15.9;
+   $formats{'all'}{6}{'width'}=17.2;
+   $formats{'all'}{8}{'width'}=7.3;
+   $formats{'all'}{9}{'width'}=7.3;
+
+=cut
+   #$rpt_object->write_excel_file($excel_file,\@rpt_headers,\@rpt,3,\%formats);
+   $rpt_object->write_excel_file($excel_file,\@rpt_headers,\@rpt);
+   $rpt_object->email_attachment($excel_file);
+   $rpt_object->email_attachment($zip_file);
+   $rpt_object->email_to($mail_to);
+   $rpt_object->email_from('NAS_Provision_Report');
+   $rpt_object->email_subject("Srdb $srdb NAS provision report");
+   my @eheaders;
+   push @eheaders,curr_date_time;
+   my @email_headers=('Comp','Status','Useable GB','NFS URI','CIFS URI');
+   $rpt_object->MakeEmailBodyHeaders("Nas provision Srdb $srdb Nexus $nexus","Requester verify the storage by mounting the URI's listed below",\@eheaders);
+   $rpt_object->MakeEmailBody(\@email_headers,\@email_rpt);
+   my @footers;
+   push @footers,"$Common::basename ver $VERSION";
+   $rpt_object->MakeEmailFooter(\@footers);
+   $rpt_object->SendEmail unless ($mail_to eq 'none');
+}
+###########################################################################
+sub date_to_epoch{
+###########################################################################
+    my $date=shift;
+    my @line=split /\//,$date;
+    my $mon=$line[0]; $mon--;
+    my $mday=$line[1];
+    my $year=$line[2];
+    #print "\ndate=>$date";
+    #print " mon=>$mon mday=>$mday year=>$year ";
+    #my $time = timelocal(59,59,23,$mday,$mon,$year);
+    my $time = timelocal(00,00,00,$mday,$mon,$year);
+    #say "epoch=>$time";
+    return $time;
+}
+###########################################################################
+sub file_copies{
+###########################################################################
+    return;
+=cut
+    if ( -f $tracker_xls ){
+       unlink $tracker_xls or warn "Unable to unlink $tracker_xls $!\n";
+    }
+    copy ($excel_file,$tracker_xls) or warn "Unable to copy to $tracker_xls\n";
+    chmod 0444,$tracker_xls;
+    if ( -f $share_tracker){
+       unlink $share_tracker or warn "Unable to unlink $share_tracker $!\n";
+    }
+=cut
+}
+###########################################################################
+sub rpt_headers{
+###########################################################################
+=cut
+              $$ref{Comp}||' ',
+              $$ref{Comp_Status}||' ',
+              $$ref{'Comp Provision'}||' ',
+              $$hoh{Key}{allocated_gb}||' ',
+              $$hoh{Key}{usuable_gb}||' ',
+              $$hoh{Key}{NFS_export_URI}||' ',
+              $$hoh{Key}{CIFS_export_URI}||' ',
+              $$hoh{NFS}{NFS_export_path}||' ',
+              $$hoh{NFS}{NFS_rw}||' ',
+              $$hoh{NFS}{NFS_ro}||' ',
+              $$hoh{NFS}{NFS_root}||' ',
+              $$hoh{NFS}{NFS_comment}||' ',
+              $$hoh{CIFS}{CIFS_share}||' ',
+              $$hoh{CIFS}{CIFS_change}||' ',
+              $$hoh{CIFS}{CIFS_read}||' ',
+              $$hoh{CIFS}{CIFS_full}||' ',
+              $$hoh{CIFS}{CIFS_comment}||' ',
+              $$hoh{CIFS}{CIFS_other}||' ',
+              $$hoh{CIFS}{CIFS_unix}||' ',
+              $$hoh{CIFS}{CIFS_unix}||' ',
+              $$hoh{Key}{bitmode_perms}||' ',
+              $$hoh{Snapmirrors}{sm_type}||' ',
+              $$hoh{Snapmirrors}{sm_source}||' ',
+              $$hoh{Snapmirrors}{sm_destination}||' ',
+              $$hoh{Snapshot}{snap_reserve}||' ',
+              $$hoh{Snapshot}{snap_weekly}||' ',
+              $$hoh{Snapshot}{snap_daily}||' ',
+              $$hoh{Snapshot}{snap_hourly}||' '
+=cut
+    my @headers=(
+      'Comp',
+      'Comp Status',
+      'Comp Provision',
+      'Alloc',
+      'Useable',
+      'NFS URI',
+      'CIFS URI',
+      'NFS exports path',
+      'NFS RW exports',
+      'NFS RO exports',
+      'NFS ROOT exports',
+      'NFS exports comment',
+      'CIFS share',
+      'CIFS change',
+      'CIFS read',
+      'CIFS full control',
+      'CIFS comment',
+      'CIFS other',
+      'CIFS unix',
+      'bitmode permissions',
+      'Snapmirror type',
+      'Snapmirror source',
+      'Snapmirror destination',
+      'Snapshot reserve',
+      'Snapshot weekly',
+      'Snapshot daily',
+      'Snapshot hourly'
+   );
+   return @headers;
+}#end sub rpt_headers
+###########################################################################
+sub usage{
+###########################################################################
+   say "Usage: pnasrpt -s|--srdb <srdb num> -m <email_address>";
+   exit 1;
+}
+###########################################################################
+sub select_query{
+###########################################################################
+my $select_query=<<END;
+SELECT
+StorageReqs_Server.Server_Name,
+StorageReqs_Request_Component.Growth_Type,
+StorageReqs_Request_Component.Target_Impl_Date,
+StorageReqs_Storage_Request.Request_Status AS 'Request_Status',
+--cast(StorageReqs_Request_Component.Request_ID as varchar) + '.' + cast(StorageReqs_Request_Component.Comp_ID as varchar) as 'SRDB.Comp',
+StorageReqs_Request_Component.Request_ID as 'SRDB',
+StorageReqs_Request_Component.Comp_ID as 'Comp',
+StorageReqs_Storage_Request.NSR_NWR AS 'Nexus',
+StorageReqs_Storage_Request.AIT_Number AS 'AIT',
+StorageReqs_Request_Component.Disk_Data_Volume AS 'Alloc',
+StorageReqs_Request_Component.Disk_Subsystem_Name AS 'Disk Subsystem',
+StorageReqs_Request_Component.Disk_Checklist2_Notes AS 'Disk_Notes2',
+StorageReqs_Request_Component.Disk_Checklist3_Notes AS 'zone_request',
+StorageReqs_Request_Component.Disk_Checklist4_Notes AS 'luns_carved',
+StorageReqs_Request_Component.Disk_Checklist7_Notes AS 'lun_security',
+StorageReqs_Request_Component.Connectivity_Type AS 'Disk Product',
+StorageReqs_Request_Component.Comp_Status,
+StorageReqs_Request_Component.Disk_Checklist7_CD AS 'Comp Provision',
+StorageReqs_Request_Component.LOB AS 'Comp LOB',
+StorageReqs_Request_Component.Additional_Comp_Info
+END
+return $select_query;
+}
+###########################################################################
+sub from_query{
+###########################################################################
+my $from_query=<<END;
+FROM StorageReqs_Request_Component INNER JOIN StorageReqs_Server
+ ON StorageReqs_Request_Component.Server_ID = StorageReqs_Server.Server_ID
+INNER JOIN StorageReqs_Storage_Request ON StorageReqs_Request_Component.Request_ID = StorageReqs_Storage_Request.Request_ID
+INNER JOIN StorageReqs_Users ON StorageReqs_Request_Component.disk_contact_primary_pn  = cast(StorageReqs_Users.PersonNumber as varchar)
+LEFT OUTER JOIN Storagereqs_Users as user_sse ON StorageReqs_Storage_Request.Assigned_CSR = cast(user_sse.PersonNumber as varchar)
+END
+return $from_query;
+}
+###########################################################################
+sub where_query{
+###########################################################################
+#say "$_ " foreach (@comps);exit;
+my $append_txt;
+if ($srdb_num){
+   $append_txt.="AND StorageReqs_Request_Component.Request_ID in ('$srdb_num')\n";
+}
+if (@comps){
+   my $comps;
+   foreach (@comps){
+   $comps.="'$_',";
+   }
+   $comps=~s/,$//g;
+   $append_txt.=" AND StorageReqs_Request_Component.Comp_ID in ($comps)\n";
+}
+   #$append_txt.="AND StorageReqs_Request_Component.Request_ID in ('$srdb_num')\n";
+#say "$append_txt";exit;
+#$append_txt="AND (StorageReqs_Users.FirstName + StorageReqs_Users.LastName in ('CraigDwyer','MichaelDenney','Raja VenkatKondu'))";
+
+my $where_query=<<END;
+WHERE
+(StorageReqs_Request_Component.Growth_Type in ('Growth','Optimization'))
+AND
+(StorageReqs_Request_Component.Comp_Status in ('Implemented','Closed'))
+AND
+(StorageReqs_Request_Component.Connectivity_Type in ('Network Attached'))
+END
+$where_query.=$append_txt if ($append_txt);
+return $where_query;
+}
+###########################################################################
+sub order_query{
+###########################################################################
+my $order_query=<<END;
+ORDER BY
+--convert(datetime,StorageReqs_Request_Component.Target_Impl_Date, 111)
+--convert(StorageReqs_Request_Component.Target_Impl_Date, 111)
+StorageReqs_Request_Component.Request_ID,StorageReqs_Request_Component.Comp_ID
+   --StorageReqs_Request_Component.Request_ID DESC,
+   --StorageReqs_Request_Component.COMP_ID DESC
+END
+return $order_query;
+}

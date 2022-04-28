@@ -1,0 +1,405 @@
+##########################################################
+# pvol
+#  Provision a Netapp volume to BAC standards
+#Michael.S.Denney@gmail.com
+$version=1.3;
+##########################################################
+#TO DO:
+#      
+#Version history
+#1.0 initial
+#1.1 the filer commands now are in MB. GB_size *1024 $mb_size
+#1.2 GB size now gets 2.4% addded
+#1.3 vol_create_results
+###############################################################################
+#TO DO: 
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use POSIX;
+use FindBin;
+use POSIX 'strftime';
+use File::Basename;
+use Rpt;
+use Common;
+use Netapp;
+##################Global VARS#################################
+use vars qw($version $dry_run);
+use vars qw($mail_to @rpt @warn_rpt);
+use vars qw($filer $srdb_comp $aggr $vol_name $gb_size $mb_size);
+use vars qw($initials $help $override $verbose $debug);
+use vars qw($weekly $daily $hourly);
+my $date = strftime '%Y%m%d', localtime;
+my $snap=1000; #preset snap to 1000 as a figure to test if snao
+              #parameter exists or not
+##################Predeclare SUBS#############################
+use subs qw(usage sanity_check show_results);
+use subs qw(chk_aggr_free make_vol rm_orig_export);
+use subs qw(get_exports add_exports);
+use subs qw(make_snap quota_on make_sis apply_exports);
+use subs qw(exports_save_name snap_schedule);
+##############################################################
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path=$base."log";
+my $log_file=$log_path."/$script.log";
+my $err_log=$log_path."/$script.err_log";
+my $var_path=$base."var";
+##############################################################
+my $cmd_line="$script ";
+$cmd_line .="$_ " foreach (@ARGV);
+
+exit unless GetOptions(
+          'dry' => \$dry_run,
+          'c=s' => \$srdb_comp,
+          'f=s' => \$filer,
+          'a=s' => \$aggr,
+          'n=s' => \$vol_name,
+          'g=i' => \$gb_size,
+          'i=s' => \$initials,
+          'v' => \$verbose,
+          'd' => \$debug,
+          's=i' => \$snap,
+          'h' => \$help,
+          'weekly=i' => \$weekly,
+          'daily=i' => \$daily,
+          'hourly=s' => \$hourly,
+          'm=s' => \$mail_to
+);
+usage if $help;
+if ($debug){
+   print "filer=>$filer\n";
+   print "aggr=>$aggr\n";
+   print "vol_name=>$vol_name\n";
+   print "gb_size=>$gb_size\n";
+   print "initials=>$initials\n";
+   print "snap=>$snap\n";
+}#end if debug
+unless (($filer) and ($aggr) and ($vol_name) and ($gb_size) and ($initials) and ($snap ne 1000)){
+   usage "dont_exit";
+   print "ERROR->-c srdb.comp missing\n" unless  $srdb_comp;
+   print "ERROR->-f filer missing\n" unless  $filer;
+   print "ERROR->-a aggr missing\n" unless  $aggr;
+   print "ERROR->-n vol_name missing\n" unless  $vol_name;
+   print "ERROR->-g gb_size missing\n" unless  $gb_size;
+   print "ERROR->-i initials missing\n" unless  $initials;
+   print "ERROR->-s snap missing\n" unless  ($snap ne 1000);
+   exit 1;
+}
+#print "verbose on\n" if $verbose;
+#print "debug on\n" if $debug;
+$verbose=1 if $debug;
+#sanity_check;
+my $common=Common->new;
+$Common::rpt_log=$log_file;
+my $netapp=Netapp->new;
+$Netapp::srdb_comp=$srdb_comp;
+slogit "INFO $cmd_line";
+slogit "INFO orig gb size=>$gb_size";
+$gb_size+=($gb_size * .024);
+slogit "INFO new gb size=>$gb_size"; 
+$mb_size=$gb_size * 1024;
+chk_aggr_free;
+mount_vol($filer,'vol0',$$);
+my $orig_exports=get_file($$,$filer,'vol0','etc/exports');
+#determine file_name to use for save
+my $save_file_name=save_name($$,$filer,'vol0',"etc/exports.$date.$initials");
+slogit "INFO save_file_name->$save_file_name\n";
+save_file($orig_exports,$$,$filer,'vol0',$save_file_name);
+make_vol;
+rm_orig_export;
+my $new_exports=add_exports;
+save_file($new_exports,$$,$filer,'vol0',"etc/exports");
+umount_vol($filer,'vol0',$$);
+#umount_vol($filer,'vol0',$$);print "$_\n" foreach(@$new_exports);exit;
+apply_exports;
+if ($snap ne 0){
+   make_snap ;
+   if ((defined $weekly) or (defined $daily) or (defined $hourly)){
+      snap_schedule;
+   }#end if weekly or
+}#end if $snap ne 0
+quota_on;
+make_sis;
+show_results;
+
+exit;
+##########################################################
+sub snap_schedule{
+##########################################################
+   $weekly = 0 unless $weekly;
+   $daily = 0 unless $daily;
+   $hourly = 0 unless $hourly;
+   my $cmd="snap sched $vol_name $weekly $daily $hourly";
+   return if $dry_run;
+   my ($stdout,$stderr)=run_cmd("ssh $filer $cmd");
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   print "$_\n" foreach (@$stdout);
+}
+##########################################################
+sub rm_orig_export{
+##########################################################
+   my $cmd="ssh $filer exportfs -z /vol/$vol_name";
+   return if $dry_run;
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   print "$_\n" foreach (@$stdout);
+}
+##########################################################
+sub apply_exports{
+##########################################################
+   my $cmd="ssh $filer exportfs /vol/$vol_name";
+   return if $dry_run;
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   print "$_\n" foreach (@$stdout);
+}
+##########################################################
+sub get_exports{
+##########################################################
+   #my $cmd="rdfile /etc/exports";
+   my $cmd="cat /var/tmp/$$/$filer/vol0/etc/exports";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   chomp @$stdout;
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   #print Dumper(@$stdout);
+   return $stdout;
+}
+##########################################################
+sub add_exports{
+##########################################################
+   #Add the new volume to the exports file with BAC standard
+   #and remove the auto created vol
+   my $vol_export="/vol/$vol_name -sec=sys,rw=chiinfspap02.bankofamerica.com:tx2xpvlxxl.bankofamerica.com:va2xpvlx6t.bankofamerica.com,root=chiinfspap02.bankofamerica.com:tx2xpvlxxl.bankofamerica.com:va2xpvlx6t.bankofamerica.com,nosuid";
+   $vol_export.=" #SR$srdb_comp#" if ($srdb_comp);
+   my @new_array;
+   my $orig_cnt=0;
+   my $vol_line_found=0;# flag if the vol0 line found
+   #print "line 0 -> $$orig_exports[0]\n";exit;
+   foreach (@$orig_exports){
+      push @new_array,$_ unless (/^\/vol\/$vol_name\s+/);
+      if ( /^\/vol\/vol0\s+/){
+         #print "$_ LINE#$orig_cnt\n";exit;
+         $vol_line_found=1;
+         push @new_array,$vol_export;
+      }
+      $orig_cnt++;
+   }
+   push @new_array,$vol_export unless ($vol_line_found);
+   #foreach (@new_array){ print "$_\n";}
+   return \@new_array;
+}
+##########################################################
+sub quota_on{
+##########################################################
+   my $cmd="quota on $vol_name";
+   return if $dry_run;
+   my ($stdout,$stderr)=run_cmd("ssh $filer $cmd");
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+}
+##########################################################
+sub make_sis{
+##########################################################
+   my $cmd="sis on /vol/$vol_name";
+   return if $dry_run;
+   my ($stdout,$stderr)=run_cmd("ssh $filer $cmd");
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+}
+##########################################################
+sub make_snap{
+##########################################################
+   my $cmd="ssh $filer snap reserve $vol_name $snap";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+}
+##########################################################
+sub make_vol{
+##########################################################
+   my $snap_size;
+   if ($snap ne 0){
+      my $snap_size=$gb_size * ".$snap";
+      $gb_size+=$snap_size;
+      $gb_size=ceil($gb_size);
+   }
+   my $cmd="vol create $vol_name $aggr $gb_size"."g";
+   return if $dry_run;
+   my ($stdout,$stderr)=run_cmd("ssh $filer $cmd");
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting due to error above\n";
+        umount_vol($filer,'vol0',$$);
+        exit 1;
+   }
+   slogit "INFO $_\n" foreach (@$stdout);
+   foreach (@$stdout){
+      if (/failed/){
+         slogit "ERROR Aborting due to failed message\n";
+        umount_vol($filer,'vol0',$$);
+         exit 1;
+      }
+   }
+   if (grep /already exists/i,@$stdout){
+       slogit "ERROR aborting beause vol exists";
+       umount_vol($filer,'vol0',$$);
+       exit 1;
+   }
+}
+##########################################################
+sub chk_aggr_free{
+##########################################################
+   my $cmd="df -h -A $aggr|egrep -v -e snapshot -e ^Aggregate";
+   my ($stdout,$stderr)=run_cmd("ssh $filer $cmd");
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   #print "$_\n" foreach (@$stdout);
+   my $capacity;
+   foreach (@$stdout){
+      if ( /.+\s+(\d+)%\s*$/ ){
+         $capacity=$1;
+      }
+   }
+   print "aggr $aggr capacity=>$capacity\n" if $debug;
+   if (( $capacity gt 95) and (! $override)){
+      print "aggr $aggr capacity=>$capacity greater then 95%m aborting\n";
+      slogit "ERROR aggr $aggr capacity=>$capacity greater then 95%m aborting\n";
+      exit 1;
+   }
+}
+##########################################################
+sub error_msg{
+##########################################################
+      print "In error msg:\n" if $debug;
+      print "@_\n";
+      open (ERR_FILE,">>$err_log")
+           or die "Unable to open $err_log";
+      print ERR_FILE "@_\n";
+      close ERR_FILE;
+}
+##########################################################
+sub show_results{
+##########################################################
+   my @results;
+   slogit "###################################################";
+   slogit "###########  $srdb_comp RESULTS ";
+   slogit "###################################################";
+
+   my $cmd="ssh $filer df -h $vol_name";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "$_\n" foreach (@$stdout);
+   push @results,@$stdout;
+   $cmd="ssh $filer snap reserve $vol_name";
+   ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "$_\n" foreach (@$stdout);
+   push @results,@$stdout;
+   $cmd="ssh $filer snap sched $vol_name";
+   ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   slogit "$_\n" foreach (@$stdout);
+   push @results,@$stdout;
+   $cmd="ssh $filer exportfs -q /vol/$vol_name";
+   ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $filer $_" foreach (@$stdout);
+        slogit "ERROR STDERR $filer $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        Netapp::write_srdb_results('vol_err',\@warn_rpt);
+        return undef if (@$stderr);
+   }
+   slogit "$_\n" foreach (@$stdout);
+   push @results,@$stdout;
+   Netapp::write_srdb_results('vol_create',\@results);
+}
+##########################################################
+sub usage{
+##########################################################
+   print "NAME\n";
+   print "       $script - Create Netapp volumes to BAC standards\n";
+   print "\nSYNOPSIS\n";
+   print "       $script [-c <srdb.comp>] -f <filer> -a <aggr> -n <vol_name> -g <gb_size> -s <snap> [--weekly <weekly snaps>] [--daily <daily snaps>] [--hourly <hourly snaps>] -i <initials> [-h] [-o] [-d] [-v] [--dry]\n";
+   print "\nOPTIONS\n";
+   print "       -c <comp> = srdb comp number\n";
+   print "       -f <filer> = filer name to create vol on\n";
+   print "       -a <aggr> = aggregate name to create vol in\n";
+   print "       -n <vol_name> = vol name\n";
+   print "       -g <gb_size> = vol size in gb\n";
+   print "       -s <snap> = snap percentage size, 0 for none\n";
+   print "       [--weekly <weekly snaps>] = number of weekly snaps to retain\n";
+   print "       [--daily <daily snaps>] = number of daily snaps to retain\n";
+   print "       [--hourly <hourly snaps>] = number of hourly snaps to retain\n";
+   print "                  For the hourly snaps, the standard @ schedule can\n";
+   print "                  be specified if required.\n";
+
+   print "       [-o] = Override the less then 96% aggr utilized capacity requirement\n";
+   print "       [--dry]  = dry run\n";
+   print "       [-d]  = debug\n";
+   print "       [-v]  = verbose\n";
+   print "       [-h]  = help\n";
+   print "       [] indicates optional parameters\n";
+   print "\n\n";
+   print "Logs are kept @ $log_path\n";
+   exit unless shift;
+}

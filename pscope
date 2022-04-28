@@ -1,0 +1,442 @@
+##########################################################
+# pscope
+# Scope a srdb comp for a provision action
+#Michael.S.Denney@gmail.com
+$version=1.13;
+##########################################################
+#TO DO:
+#      
+#Version history
+#1.0 initial
+#1.1 integration with qait script for AIT->app short name determination
+#1.11 app name returned from qait now removes white space and dash
+#1.13 WIP support
+###############################################################################
+#TO DO: 
+#    Correctly determine the vol name if given a fqdn filer
+###############################################################################
+use strict;
+use warnings;
+use Getopt::Long;
+use Data::Dumper;
+use POSIX;
+use FindBin;
+use POSIX 'strftime';
+use File::Basename;
+use Rpt;
+use Common;
+use Netapp;
+##################Global VARS#################################
+use vars qw($version $dry_run);
+use vars qw($mail_to @rpt @warn_rpt);
+use vars qw($filer $srdb_comp $gb_size $usable);
+use vars qw($initials $help $override $verbose $debug);
+use vars qw($ait $app $data_type $environ $snap $util);
+use vars qw($nfs_rw $nfs_ro $nfs_root $uid $gid $noping);
+use vars qw($nfs_rw_file $nfs_ro_file $nfs_root_file );
+use vars qw($cifs_share $cifs_read $cifs_change);
+use vars qw($weekly $daily $hourly);
+my $date = strftime '%Y%m%d', localtime;
+my $snap=1000; #preset snap to 1000 as a figure to test if snao
+              #parameter exists or not
+##################Predeclare SUBS#############################
+use subs qw(usage sanity_check show_results);
+use subs qw(get_aggr_free sanitize sanity_chk);
+use subs qw(determine_aggr determine_vol_name determine_qtree_name);
+use subs qw(qtree_create qait);
+##############################################################
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path=$base."log";
+my $log_file=$log_path."/$script.log";
+my $err_log=$log_path."/$script.err_log";
+my $var_path=$base."var";
+##############################################################
+my $cmd_line="$script ";
+$cmd_line .="$_ " foreach (@ARGV);
+
+exit unless GetOptions(
+          'dry' => \$dry_run,
+          'c|comp=s' => \$srdb_comp,
+          'f|filer=s' => \$filer,
+          'a|ait=i' => \$ait,
+          'app=s'  => \$app,
+          'data=s' => \$data_type,
+          'e|environ=s' =>\$environ,
+          'g|gb=i' => \$gb_size,
+          'i=s' => \$initials,
+          'v' => \$verbose,
+          'd' => \$debug,
+          's|snap=i' => \$snap,
+          'u|util=i' => \$util,
+          'cifs_share=s' => \$cifs_share,
+          'cifs_read=s' => \$cifs_read,
+          'cifs_change=s' => \$cifs_change,
+          'nfs_rw=s' => \$nfs_rw,
+          'nfs_ro=s' => \$nfs_ro,
+          'nfs_root=s' => \$nfs_root,
+          'nfs_rw_file=s' => \$nfs_rw_file,
+          'nfs_ro_file=s' => \$nfs_ro_file,
+          'nfs_root_file=s' => \$nfs_root_file,
+          'uid=i' => \$uid,
+          'gid=i' => \$gid,
+          'noping' => \$noping,
+          'weekly=i' => \$weekly,
+          'daily=i' => \$daily,
+          'hourly=s' => \$hourly,
+          'h' => \$help,
+          'm=s' => \$mail_to
+);
+usage if $help;
+if ($debug){
+   print "filer=>$filer\n";
+   print "ait=>$ait\n";
+   print "app_name=>$app\n";
+   print "data_type=>$data_type\n";
+   print "environ=>$environ\n";
+   print "gb_size=>$gb_size\n";
+   print "snap=>$snap\n";
+   print "initials=>$initials\n";
+   print "util=>$util\n" if $util;
+}#end if debug
+unless (($filer) and ($ait) and ($data_type) and ($environ) and ($gb_size) and ($initials) and ($snap ne 1000)){
+   usage "dont_exit";
+   print "ERROR->-c srdb.comp missing\n" unless  $srdb_comp;
+   print "ERROR->--filer missing\n" unless  $filer;
+   print "ERROR->--ait missing\n" unless  $ait;
+   #print "ERROR->--app missing\n" unless  $app;
+   print "ERROR->--data type missing\n" unless  $data_type;
+   print "ERROR->--environ missing\n" unless  $environ;
+   print "ERROR->--gb missing\n" unless  $gb_size;
+   print "ERROR->--snap missing\n" unless  ($snap ne 1000);
+   print "ERROR->-i initials missing\n" unless  $initials;
+   exit 1;
+}
+#print "verbose on\n" if $verbose;
+#print "debug on\n" if $debug;
+$verbose=1 if $debug;
+#sanity_check;
+my $common=Common->new;
+$Common::rpt_log=$log_file;
+my $netapp=Netapp->new;
+$Netapp::srdb_comp=$srdb_comp;
+slogit "INFO $cmd_line";
+sanitize;
+sanity_chk;
+$app=qait unless $app;
+my $aggrs=get_aggr_free;
+my $aggr=determine_aggr($aggrs);
+my $vol=determine_vol_name;
+my $qtree=determine_qtree_name;
+slogit "####################################################################";
+slogit "###SCOPE OF comp $srdb_comp for $usable"."GB useable,$gb_size"."GB actual";
+slogit "####################################################################";
+slogit "INFO aggr->$aggr vol->$vol qtree->$qtree";
+slogit "INFO Vol create-> /root/provision/bin/pvol -c $srdb_comp -f $filer -a $aggr -n $vol -g $usable -s $snap --weekly $weekly --daily $daily --hourly $hourly -i $initials\n";
+qtree_create;
+
+
+exit;
+##########################################################
+sub qait{
+##########################################################
+   my $cmd="/usr/local/bin/qait --id $ait";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "Abort because error above";
+   }
+   foreach (@$stdout){
+      if (/^Short name\s+=\s+(.*)$/){
+         #print "$_\n";
+         my $app=$1;
+         $app=~s/[-\s]+//g;
+         return $app;
+      }#end if Short Name
+   }#end foreach stdout
+   slogit "ERROR Unable to determine app short name for AIT $ait";
+   slogit "ERROR Aborting since app was not specified and unable to auto determine";
+   exit 1;
+}
+##########################################################
+sub qtree_create{
+##########################################################
+   return unless ( $nfs_rw or $nfs_ro or $nfs_root or $cifs_share or $nfs_rw_file or $nfs_ro_file or $nfs_root_file);
+   my $q_create="INFO Qtree create-> /root/provision/bin/pqtree -c $srdb_comp -f $filer -n $vol -g $usable -q $qtree -i $initials";
+   $q_create.=" --nfs_rw $nfs_rw" if $nfs_rw;
+   $q_create.=" --nfs_ro $nfs_ro" if $nfs_ro;
+   $q_create.=" --nfs_root $nfs_root" if $nfs_root;
+   $q_create.=" --nfs_rw_file $nfs_rw_file" if $nfs_rw_file;
+   $q_create.=" --nfs_ro_file $nfs_ro_file" if $nfs_ro_file;
+   $q_create.=" --nfs_root_file $nfs_root_file" if $nfs_root_file;
+   $q_create.=" --uid $uid" if $uid;
+   $q_create.=" --gid $gid" if $gid;
+   $q_create.=" --cifs_share $cifs_share" if $cifs_share;
+   $q_create.=" --cifs_read \'$cifs_read\'" if $cifs_read;
+   $q_create.=" --cifs_change \'$cifs_change\'" if $cifs_change;
+   $q_create.=" --noping" if $noping;
+   slogit $q_create;
+}
+##########################################################
+sub determine_qtree_name{
+##########################################################
+   my $cmd="ssh $filer qtree status";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   my %qtree_nums;
+   foreach (@$stdout){
+          #print "$_\n";
+      #if (/^\S+\s+$ait\_\S+\_$environ(\d+)\s+/i){
+      if (/^\S+\s+$ait\_$app(\d+)\_\S+\s+/i){
+          print "$_\n";
+          #print "$1\n";
+          $qtree_nums{$1}=1;
+      }#end it
+   } #end foreach 
+   my $qtree_num=1;
+   $qtree_num=( (sort {$a<=>$b} keys %qtree_nums)[-1])if %qtree_nums;
+   $qtree_num++ if %qtree_nums;
+   #say "$ait\_$app$qtree_num\_$environ";exit;
+   return "$ait\_$app$qtree_num\_$environ";
+}
+##########################################################
+sub determine_vol_name{
+##########################################################
+   my $cmd="ssh $filer vol status -l";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   my %vol_nums;
+   foreach (@$stdout){
+      #say $_;
+      if (/^\s*\S+\_$data_type\_(\d+)\s+/) {
+         #print "$_\n";
+         $vol_nums{$1}=1;
+         next;
+      }#end if 
+      if (/^\s*$data_type(\d+)\s+/) {
+         #print "$_\n";
+         $vol_nums{$1}=1;
+         next;
+      }#end if 
+   }#end foreach @$stdout
+   my $vol_num=1;#starting num if no vols existing on filer
+   $vol_num=( (sort {$a<=>$b} keys %vol_nums)[-1])if %vol_nums;
+   $vol_num++ if %vol_nums;
+   #say "$filer\_$data_type\_$vol_num"; exit;
+   return "$filer\_$data_type\_$vol_num";
+}
+##########################################################
+sub determine_aggr{
+##########################################################
+   my $biggest_avail=0;
+   my $biggest_aggr;
+   my $biggest_capacity;
+   my $biggest_total;
+   my $biggest_used;
+   foreach (keys %$aggrs){
+      if ($biggest_avail <  $$aggrs{$_}{avail}){
+         $biggest_avail=$$aggrs{$_}{avail};
+         $biggest_capacity=$$aggrs{$_}{capacity};
+         $biggest_total=$$aggrs{$_}{total};
+         $biggest_used=$$aggrs{$_}{used};
+         $biggest_aggr=$_;
+      }
+      #print "$_ $$aggrs{$_}{avail} $$aggrs{$_}{capacity}\n";
+   }
+   slogit "INFO biggest aggr->$biggest_aggr $biggest_total GB $biggest_used GB $biggest_avail Gb $biggest_capacity %\n";
+   my $percent=sprintf "%.2f", ($biggest_used+$gb_size)/$biggest_total;#round it
+   $percent=sprintf "%.2u", 100*$percent;#convert decimal to percentage integer
+   slogit "DEBUG percent $percent util $util" if $debug;
+   if ($percent > $util){
+       slogit "ERROR aggr $biggest_aggr has the most available GB capacity $biggest_avail";
+       slogit "ERROR However, after adding $gb_size the capacity utilized will be $percent";
+       slogit "ERROR Which exceeds the utilization threshold of $util"; 
+       exit 1;
+   }
+   slogit "INFO The new capacity of aggr $biggest_aggr after adding $gb_size"."GB->$percent%";
+   return $biggest_aggr;
+}
+##########################################################
+sub sanity_chk{
+##########################################################
+   unless ($srdb_comp =~ /^\d+\.\d+$/){
+      slogit "ERROR srdb_comp not in num-dot-num format";
+      exit;
+   }
+   my $cmd="ssh $filer hostname";
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        slogit "ERROR Aborting because above error";
+        exit 1;
+   }
+   unless (grep /^$data_type$/,qw(d db h g b test wip)){
+      slogit "ERROR data_type needs to be one of these values=>d db h g b wip"; 
+      exit 1;
+   }
+   unless (grep /^$environ$/,qw(uat dev prd ppd sit dr)){
+      slogit "ERROR environ needs to be one of these values=>uat dev prd ppd sit dr"; 
+      exit 1;
+   }
+   if ($cifs_share){
+      unless ($cifs_change or $cifs_read){
+          slogit "ERROR --cifs_read or --cifs_change required if --cifs_share";
+          exit 1;
+      }
+   }
+   if ($nfs_rw and $nfs_rw_file){
+      slogit "ERROR can not specify both nfs_rw and nfs_rw_file";
+      exit 1;
+   }
+   if ($nfs_ro and $nfs_ro_file){
+      slogit "ERROR can not specify both nfs_ro and nfs_ro_file";
+      exit 1;
+   }
+   if ($nfs_root and $nfs_root_file){
+      slogit "ERROR can not specify both nfs_root and nfs_root_file";
+      exit 1;
+   }
+}
+##########################################################
+sub sanitize{
+##########################################################
+   $usable=$gb_size;
+   slogit "INFO orig gb size=>$gb_size";
+   $gb_size=$gb_size*"1.$snap";
+   slogit "INFO added $snap% snap gb size=>$gb_size";
+   #my $percent=sprintf "%.2f", ($biggest_used+$gb_size)/$biggest_total;#round it
+   $gb_size=sprintf "%u", ($gb_size * 1.024);#*.024 rounded
+   slogit "INFO new gb size=>$gb_size"; 
+   $app=lc $app;
+   $filer=lc $filer;
+   $data_type=lc $data_type;
+   $environ=lc $environ;
+   $initials=lc $initials;
+   $util=95 unless defined $util;
+   $weekly = 0 unless defined $weekly;
+   $daily = 31 unless defined $daily;
+   $hourly = 0 unless defined $hourly;
+   $snap = 15 unless defined $snap;
+
+}
+##########################################################
+sub get_aggr_free{
+##########################################################
+   my %aggrs;
+   my $cmd="df -g -A |egrep -v -e snapshot -e ^Aggregate";
+   my ($stdout,$stderr)=run_cmd("ssh $filer $cmd");
+   if (@$stderr){
+        slogit "ERROR STDOUT $_" foreach (@$stdout);
+        slogit "ERROR STDERR $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+   }
+   #print "$_\n" foreach (@$stdout);
+   foreach (@$stdout){
+      my $capacity;my $aggr;my $avail;my $total;my $used;
+      say $_;
+      if ( /(\S+)\s+(\S+)GB\s+(\S+)GB\s+(\S+)GB\s+(\d+)%\s*$/ ){
+         $aggr=$1;
+         $total=$2;
+         $used=$3;
+         $avail=$4;
+         $capacity=$5;
+         #say "aggr->$aggr avail=>$avail";
+      }
+      if (( $capacity >= $util)){
+         print "aggr  capacity=>$capacity greater then or equal to 95%m skip\n" if $debug;
+         next;
+      }#end if $capacity gt
+      print "aggr $aggr avail=>$avail capacity=>$capacity\n" if $debug;
+      next if ($aggr=~/_NC$/i);
+      $aggrs{$aggr}{avail}=$avail;
+      $aggrs{$aggr}{total}=$total;
+      $aggrs{$aggr}{capacity}=$capacity;
+      $aggrs{$aggr}{used}=$used;
+   }##foreach @$stdout
+   unless (%aggrs){
+       slogit "ERROR No aggregates on $filer less then $util% capacity";
+       exit 1;
+   }
+   return \%aggrs;
+}
+##########################################################
+sub show_results{
+##########################################################
+   slogit "###################################################";
+   slogit "###########  $srdb_comp RESULTS ";
+   slogit "###################################################";
+   ;return;
+
+}
+##########################################################
+sub usage{
+##########################################################
+   print "NAME\n";
+   print "       $script - Scope a filer for a provision action\n";
+   print "\nSYNOPSIS\n";
+   print "       $script [-c <srdb.comp>] -f|--filer <filer> --ait <ait num>  --app <app name> --data <data type> -e|--environ <environ> -g|--gb <gb size> -s|--snap <snap> -i <initials> [-u|--util <aggr utilized threshold>] [--nfs_rw <server_list> [--nfs_ro <server_list> [--nfs_root <server_list>] [--uid <#>] [--gid <#>] [--noping] [--cifs_chare <name>] [--cifs_read <list>] [--cifs_change <list>] [-h] [-d] [-v] [--dry]\n";
+   print "\nOPTIONS\n";
+   print "       -c|--comp <comp> = Srdb comp number.\n";
+   print "       -f|--filer  <filer> = Filer name to scope.\n";
+   print "       -a|--ait <ait num> = Ait num.\n";
+   print "       -d|--data <data type> = d,db,h,g or b.\n";
+   print "       -e|--environ <environ> = uat,dev,prd,ppd,sit or dr.\n";
+   print "       -g|--gb <gb_size> = Vol size in gb.\n";
+   print "       -s|--snap <snap> = Snap percentage size, 0 for none\n";
+   print "       [-u|--util <num>] = Override the less then 96% aggr utilized\n";
+   print "       [--nfs_rw <server_list> = servers to nfs export rw\n";
+   print "       [--nfs_ro <server_list> = servers to nfs export ro\n";
+   print "       [--nfs_root <server_list> = servers to nfs export root\n";
+   print "       [--nfs_rw_file = file name with servers to nfs export rw\n";
+   print "       [--nfs_ro_file = file name with servers to nfs export ro\n";
+   print "       [--nfs_root_file = file name with servers to nfs export root\n";
+   print "       [--uid <#> = UID to chown the qtree root directory\n";
+   print "       [--gid <#> = GID to chown the qtree root directory\n";
+   print "       [--noping  = Do not perform ping test\n";
+   print "       [--cifs_share <name>] = CIFS share name\n";
+   print "       [--cifs_read <list>] = AD group(s)/account(s) for read only CIFS access\n";
+   print "       [--cifs_change <list>] = AD group(s)/account(s) for change CIFS access\n";
+
+   print "                           capacity requirement with percent <num>\n";
+   print "       [--dry]  = dry run\n";
+   print "       [-d]  = debug\n";
+   print "       [-v]  = verbose\n";
+   print "       [-h]  = help\n";
+   print "       [] indicates optional parameters\n";
+   print "\n\n";
+   print "NFS exports cifs group/account  names can be seperated by comma or colon\n";
+   print "If the domain specification for cifs_read or cifs_change is given,then the <list> needs to be enclosed in single quotes\n";
+
+   print "       DATA TYPES\n";
+   print "               D=Data\n"; 
+   print "               DB=Database Dumps\n"; 
+   print "               H=Home Space\n"; 
+   print "               G=Group Space\n"; 
+   print "               B=Binary\n"; 
+   print "               WIP=WIP\n"; 
+   print "       ENVIRON TYPES\n";
+   print "               UAT=User Acceptance Testing\n";
+   print "               DEV=Development\n";
+   print "               PRD=Production\n";
+   print "               PPD=PreProduction\n";
+   print "               SIT=System Integration Testing\n";
+   print "               DR=Contingency/Disaster Recovery\n";
+   exit unless shift;
+}

@@ -1,0 +1,131 @@
+##########################################################
+# cifs_share_rename 
+# rename a netapp cifs share
+#Michael.S.Denney@gmail.com
+$version=1.0;
+##########################################################
+#TO DO:
+use strict;
+use warnings;
+use Getopt::Long;
+use POSIX;
+##################Global VARS#################################
+use vars qw($version $verbose $debug $filer $share $new_share);
+##################Predeclare SUBS#############################
+use subs qw(run_cmd);
+##############################################################
+exit 1 unless GetOptions(
+          'f=s' => \$filer,
+          'filer=s' => \$filer,
+          's=s' => \$share,
+          'share=s' => \$share,
+          'n=s' => \$new_share,
+          'new_share=s' => \$new_share,
+          'v' => \$verbose,
+          'd' => \$debug
+);
+my $t=' ';
+print "verbose on\n" if $verbose;
+print "debug on\n" if $debug;
+$verbose=1 if $debug;
+unless ($filer and $share and $new_share) {
+   print "Usage: cifs_share_rename -f <filer_name> -s <share_name> -n <new_share_name>\n";
+   print "Usage: cifs_share_rename --filer <filer_name> --share <share_name> --new_share <new_share_name>\n";
+   exit 1 ;
+}
+
+my $cmd="ssh $filer cifs shares $share";
+print "$cmd\n";
+my ($stdout,$stderr)=run_cmd $cmd;
+if (@$stderr){
+    print "$_\n" foreach (@$stderr);
+    exit 1;
+}
+my $path;my $comment;my $access;my %security;
+
+print "search share=>$share\n";
+foreach (@$stdout){
+   print "$_\n" ;
+   if (/^\S+\s+(\/vol\/\S+\s+|\/vol\/\S+\/\S+\s+)(.*)?/){
+      $path=$1;
+      $comment=$2;
+   }#end if regex
+   if ( /\s+(.+)\s+\/\s+Read/g){
+        push @{$security{read}},$1;
+   }
+   if ( /\s+(.+)\s+\/\s+Change/g){
+      push @{$security{change}},$1;
+   }
+   if ( /\s+(.+)\s+\/\s+Full\sControl/g){
+      push @{$security{'full control'}},$1;
+   }
+
+}
+print "path=>$path\n" if $path;
+print "comment=>$comment\n" if $comment;
+print "cifs read=>$_ \n" foreach (@{$security{read}});
+print "cifs full control=>$_ \n" foreach (@{$security{'full control'}});
+print "cifs change=>$_ \n" foreach (@{$security{change}});
+
+$cmd="$t ssh $filer cifs shares -add $new_share $path -comment \\\"$comment\\\"" if ($comment);
+$cmd="$t ssh $filer cifs shares -add $new_share $path" unless ($comment);
+print "$cmd\n";
+($stdout,$stderr)=run_cmd $cmd;
+if (@$stderr){
+    print "$_\n" foreach (@$stderr);
+    unless ((grep /MS-DOS/,@$stderr)and @$stderr == 1){
+       exit 1;
+    }
+}
+print "$_\n" foreach (@$stdout);
+
+$cmd="$t ssh $filer cifs access -delete $new_share everyone";
+print "$cmd\n";
+($stdout,$stderr)=run_cmd $cmd;
+if (@$stderr){
+    print "$_\n" foreach (@$stderr);
+    exit 1 unless (grep /successfully modified/,@$stderr);
+}
+print "$_\n" foreach (@$stdout);
+
+foreach my $type ('read','change','full control'){#type
+   print "type=$type\n";
+   foreach (@{$security{$type}}){
+      $cmd="$t ssh $filer cifs access $new_share \'$_\' $type";
+      print "$cmd\n";
+      ($stdout,$stderr)=run_cmd $cmd;
+      if (@$stderr){
+          print "$_\n" foreach (@$stderr);
+          exit 1 unless (grep /successfully modified/,@$stderr);
+      }
+      print "$_\n" foreach (@$stdout);
+   }
+}#end foreach type
+$cmd="$t ssh $filer cifs shares -delete $share";
+print "$cmd\n";
+($stdout,$stderr)=run_cmd $cmd;
+if (@$stderr){
+    print "$_\n" foreach (@$stderr);
+    exit 1;
+}
+print "$_\n" foreach (@$stdout);
+##########################################################
+sub run_cmd{
+##########################################################
+   my $cmd=" @_";
+   my $err_file="/dev/shm/err.$$";
+   $cmd.=" 2>$err_file";
+   my @stdout=qx($cmd);
+   chomp @stdout;
+   my @stderr;
+   if (-s $err_file) { #if the error file has messages
+      open ERR,"$err_file";
+      @stderr=(<ERR>);
+      close ERR;
+      chomp @stderr;
+      #print "$_\n" foreach (@stderr);
+   }
+   unlink ($err_file);
+   return (\@stdout,\@stderr);
+}
+

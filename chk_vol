@@ -1,0 +1,11 @@
+FILER=$1
+VOL=$2
+QTREE=$3
+ssh $FILER "priv set advanced;ls /vol/$VOL" 2> /dev/shm/chk_vol.$$
+CNT=`sed 1,5d /dev/shm/chk_vol.$$|grep -v $QTREE|wc -l`
+rm -f /dev/shm/chk_vol.$$
+if [ $CNT -eq 0 ] ; then
+    exit 0
+else
+    exit 1
+fi

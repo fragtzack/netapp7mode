@@ -1,0 +1,1480 @@
+##########################################################
+# nas_reclaim
+# Given an input file of "comp# filer:/vol/<vol>/<qtree>" per line,
+#   map the details needed for a reclaim into a csv and Excel file.
+#   email the results summary in HTML/CSS, with the Excel attached
+#Michael.S.Denney@gmail.com
+$version=5.4;
+##########################################################
+#TO DO:
+#      destination exports/cifs search
+#      detect if qtree delete works (ontap ver issue)
+#Version history
+#1.1 Added support for email
+#1.2 Renamed to discover-srdb
+#1.3 Http urls added to email html
+#1.4 Input file allowed to be with or without comp# on each line
+#1.4 count_fields sub added for Input file flexibiity
+#1.5 added CIFS style input rountines
+#1.5 added determine_vol_qtree for CIFS style input
+#2.0 big revamp to accomdate nfs+cifs and meet all needs of the reclaim track
+#2.1 better error handle messages
+#2.2 email has section for error messages
+#2.3 email allows multiple attachments, 1 excel 1 input file
+#2.4 $path = determine_path
+#2.5 quota report returns files used and get_df also returns vol snap reserve %
+#2.6 determine_path merged with determine_vol_qtree
+#2.7 verify_vol_qtree
+#2.8 determine_vol_snap
+#2.9 srdb and component seperated, changed error conditions to still push @rpt
+#3.0 fix to cifs path determinination in determine_vol_qtree
+#3.1 fixed determine_vol_snap to account for 9% or less correctly
+#3.2 fixed to determine CIFS if NFS uri and multiprotocol
+#3.3 GB reduce column
+#3.4 reclaim_cmds
+#3.5 fixed reclaims where snapmirror destination volume name is different then
+#    source
+#3.6 fixed quota report to pickup on - in the capacity
+#3.7 Check for duplicate uri's
+#3.8 qtree status save file now gets linefeeds for every line
+#3.9 -f option to force qtree delete (if data exists)
+#4.0 detection of snapmirror qtree
+#4.2 detection of snapmirror qtree if delete type is vol
+#4.3 sm destinations column
+#4.4 major fixed to SM commands:multiple destinations,qtree snapmirror if 
+#      vol delete type
+#4.5 fixed qtree delete not reducing vol size
+#4.6 search in determine_vol_qtree are now case insensitve
+#4.7 Handling (skip) of lines with only white space in input file
+#    Handling of ERR condition for gb_vol_reduce
+#4.8 $cifs_share set to ' ' if cifs_share not detected because ERR
+#4.9 detect if snapmirror is broken or not
+#5.0 chk_vol check vol if the qtree deleted is the 
+#      last one in volume.
+#5.1 -n xxx for nexus num
+#5.2 archive_srdb
+#5.3 vol deletions now account for snap reserve in calculating GB reclaimed
+#5.4 email_notify for backups to dg.gso_br_backup_production_support@bankofamerica.com
+###############################################################################
+#TO DO: 
+use strict;
+use warnings;
+use Getopt::Long;
+use IPC::Open3;
+use IO::Select; # for select
+use Symbol; # for gensym
+use Data::Dumper;
+use Rpt;
+use Common;
+use POSIX;
+use File::Copy;
+##################Global VARS#################################
+use vars qw($version $verbose $debug $srdb_num $csv_array);
+use vars qw(%filer_vol_qtrees @rpt @error_rpt @email_rpt $mail_to);
+use vars qw(@warn_rpt $input_file %reclaims %uris $force);
+use vars qw(%exports_saved %quota_saved %snapmirror_saved);
+use vars qw(@backup_cmds $nexus @email_notify);
+my $email_notify='dg.gso_br_backup_production_support@bankofamerica.com,dg.SBEO_Enterprise_IP_Storage@bankofamerica.com';
+# %filer_vol_qtrees is a Hash of Hash of arrays
+##################Predeclare SUBS#############################
+use subs qw(usage sanity_check real_filer_name run_ssh);
+use subs qw(snapmirror get_df cifs_shares exports quota_report);
+use subs qw(qtree_status load_qtree_hash prep_mail count_fields);
+use subs qw(duplicate_check determine_vol_qtree determine_uri);
+use subs qw(handle_warnings email verify_vol_qtree reclaim_cmds);
+use subs qw(mirror_state archive_srdb);
+##############################################################
+GetOptions(
+          's=i' => \$srdb_num,
+          'n=i' => \$nexus,
+          'v' => \$verbose,
+          'd' => \$debug,
+          'f' => \$force,
+          'm=s' => \$mail_to
+);
+$srdb_num=$nexus if $nexus;
+usage unless $srdb_num;
+#print "verbose on\n" if $verbose;
+#print "debug on\n" if $debug;
+$verbose=1 if $debug;
+say "Force qtree delete on" if (($force)&&($verbose));
+say "Performing analysis of srdb $srdb_num ...";
+$input_file="$Common::base_dir/srdb/$srdb_num/$srdb_num.info";
+archive_srdb;
+sanity_check;
+$Common::rpt_log="$Common::base_dir/srdb/$srdb_num/$srdb_num.log";
+
+open (SRDB_FILE,"<$input_file")
+      or die "Unable to open $input_file";
+my @srdb_file=<SRDB_FILE>;
+close SRDB_FILE;
+chomp @srdb_file;
+say $_ foreach (@srdb_file);
+foreach (@srdb_file){
+    next if /^$/; #skip empty lines;
+    next if /^\s+$/; #skip lines with all white space;
+    next if /^.*#/; #skip comment lines;
+    logit "-------------------------------------------------------------------";
+    logit"####################$srdb_num######################################";
+    logit "Crunching=>$_";
+    my $sm_destroy=my $path_delete=my $qtree_delete=' ';
+    my $vol_verify=my $qtree_verify=my $path_verify=my $nfs_destination=my $cifs_destination=" ";
+
+    my ($srdb_comp,$uri,$orig_filer,$remains)=determine_uri($_);
+    next unless ($uri);
+    if ($uris{$uri}){
+       say "$uri already processed, skipping";
+       push @warn_rpt,[$srdb_comp,"$uri already processed, skipping $srdb_comp"];
+       next;
+    } else { $uris{$uri}=1;};
+    unless ($srdb_comp) {print "\n" if $verbose;next;}
+    #say "remains=>$remains";exit;
+
+    my $real_filer=real_filer_name($orig_filer);
+    unless ($real_filer) {print "\n" if $verbose;next;}
+
+    my ($vol,$qtree,$path)=determine_vol_qtree($real_filer,$remains);
+    unless ($vol) {
+       print "\n" if $verbose;
+       push @warn_rpt,["comp $srdb_comp","Unable to determine volume"];
+       next;
+    }
+    load_qtree_hash($real_filer) unless ($filer_vol_qtrees{$real_filer}); 
+
+    ($vol,$qtree)=verify_vol_qtree($real_filer,$vol,$qtree);
+
+    if ("/vol/$vol/$qtree" eq $path){
+       $qtree_delete='yes';
+    } else {$path_delete='yes'}
+
+
+    logit "srdb_comp $srdb_comp  orig_filer $orig_filer vol $vol qtree $qtree \n" if $debug;
+    unless ($srdb_comp and $orig_filer and $vol and $qtree) {
+          logit "WARN:parsing input line, skipping $_..";
+          #next;
+    }
+    if (duplicate_check($real_filer,$vol,$qtree)){
+        push @warn_rpt,[$_,"real filer=>$real_filer vol=>$vol qtree=>$qtree is duplicated in input file"];
+    }
+
+    my ($vol_capacity,$vol_used,$snap_capacity)=get_df($real_filer,$vol);
+    #unless ($vol_capacity) {print "\n" if $verbose;next;}
+
+    my $vol_delete=qtree_status($real_filer,$vol,$qtree);
+    $qtree_delete=' ' if ($vol_delete eq 'yes');
+
+    my ($state,$partner_filer,$partner_vol)=" ";
+ 
+    my ($vol_dests,$qtree_dests,$vol_sources,$qtree_sources)=snapmirror($real_filer,$vol,$qtree);
+    my $sm_destinations=join " ",@$vol_dests;
+    $sm_destinations.=join " ",@$qtree_dests;
+   
+
+    my $cifs_share=cifs_shares($real_filer,$vol,$qtree,$uri,$vol_delete,$path,$qtree_delete);
+    $cifs_share=' ' unless $cifs_share;
+
+    my $nfs_exports=exports($real_filer,$vol,$path,$vol_delete);
+
+    my ($quota_use,$quota_limit,$quota_files)=quota_report($real_filer,$vol,$qtree);
+
+
+    #$sm_destroy='yes' if (($vol_delete eq 'yes')and($partner_vol ne ' '));
+    #my $sm_vol_destroy='yes' if (($vol_delete eq 'yes')and((@$vol_dests)or(@$qtree_dests)));
+    my $sm_vol_destroy='yes' if (($vol_delete eq 'yes')and(@$vol_dests));
+    my $sm_qtree_delete='yes' if (@$qtree_dests);
+    #my $sm_qtree_delete='yes' if (($qtree_delete eq 'yes')and(@$qtree_dests));
+    if ($verbose){
+       say "sm_vol_destroy=>$sm_vol_destroy" if $sm_vol_destroy;
+       say "sm_qtree_destroy=>$sm_qtree_delete" if $sm_qtree_delete;
+    }
+    my ($snap_percent,$vol_reduce,$gb_vol_reduce)=determine_vol_snap($real_filer,$vol,$qtree,$quota_limit,$vol_capacity,$vol_used,$vol_delete);
+    my $gb_reclaim=determine_gb_reclaim($gb_vol_reduce,$vol_capacity,$vol_delete,$qtree_delete,$sm_vol_destroy,$sm_qtree_delete,$snap_capacity);
+    my $sm_target;
+    if (@$vol_sources or @$qtree_sources){
+       $qtree_delete=' ';
+       $vol_delete=' ';
+       $sm_target=1;
+    }
+    logit "Complete\n";
+    push @rpt,[$srdb_num,$srdb_comp,$uri,$real_filer,$vol,$qtree,$path,$vol_capacity,$vol_used,$snap_percent,$quota_limit,$quota_use,$quota_files,$vol_reduce,$gb_vol_reduce,$gb_reclaim,$vol_delete,$qtree_delete,$path_delete,$sm_vol_destroy,$sm_qtree_delete,$nfs_exports,$cifs_share,$nfs_destination,$cifs_destination,$sm_destinations];
+   $reclaims{$srdb_comp}{real_filer}=$real_filer;
+   $reclaims{$srdb_comp}{vol}=$vol;
+   $reclaims{$srdb_comp}{qtree}=$qtree;
+   $reclaims{$srdb_comp}{path}=$path;
+   $reclaims{$srdb_comp}{vol_reduce}=$vol_reduce;
+   $reclaims{$srdb_comp}{partner_filer}=$partner_filer;
+   $reclaims{$srdb_comp}{partner_vol}=$partner_vol;
+   $reclaims{$srdb_comp}{vol_delete}=$vol_delete;
+   $reclaims{$srdb_comp}{qtree_delete}=$qtree_delete;
+   $reclaims{$srdb_comp}{path_delete}=$path_delete;
+   $reclaims{$srdb_comp}{nfs_exports}=$nfs_exports;
+   $reclaims{$srdb_comp}{cifs_share}=$cifs_share;
+   $reclaims{$srdb_comp}{sm_destroy}=$sm_destroy;
+   $reclaims{$srdb_comp}{remains}=$remains;
+   $reclaims{$srdb_comp}{sm_vol_destroy}=$sm_vol_destroy;
+   $reclaims{$srdb_comp}{sm_qtree_delete}=$sm_qtree_delete;
+   $reclaims{$srdb_comp}{sm_destinations}=$sm_destinations;
+   $reclaims{$srdb_comp}{vol_dests}=$vol_dests;
+   $reclaims{$srdb_comp}{qtree_dests}=$qtree_dests;
+   $reclaims{$srdb_comp}{gb_vol_reduce}=$gb_vol_reduce;
+   $reclaims{$srdb_comp}{sm_target}=$sm_target;
+} #end big for loop of reading SRDB_FILE
+#print Dumper(@rpt);exit;
+reclaim_cmds;
+handle_warnings if @warn_rpt;
+if (@email_notify){
+#say "EMAIL NOTIFY!";
+   my $notify="$Common::base_dir/srdb/$srdb_num/notify";
+   open FH,">$notify" or warn "Unable to open $notify:$!\n";
+   print FH "/bin/mail -s \"NAS reclaim srdb $srdb_num\" $email_notify<<EOF\n";
+   print FH "$_\n" foreach @email_notify;
+   print FH "EOF\n";
+   close FH;
+   chmod (0755,$notify) or warn "Unable to chmod $notify:$!\n";
+}
+logit "####################$srdb_num COMPLETE##############################";
+##########################################################
+# PRODUCE csv and xls
+##########################################################
+my $rpt_object=Rpt->new;
+my $col_head='Srdb';$col_head='Nexus' if $nexus;
+my @headers=($col_head,'COMP','NAS URI','Real Filer','Volume','Qtree','Path','Vol Capacity MB','Vol Data MB','Vol Snap Reserve','Qtree Quota Limit KB','Qtree Quota use KB','Quota files used','Vol Reduce KB','Vol Reduce GB','GB to Reclaim','Vol delete','Qtree Delete','Path Delete','SM vol destroy','SM qtree delete','NFS Exports delete','Cifs share delete','Destination exports delete','Destination CIFS share delete','SM destinations');
+my $csv_file="$Common::base_dir/srdb/$srdb_num/$srdb_num.csv";
+$rpt_object->write_csv_file($csv_file,\@headers,\@rpt);
+say "CSV Report=>$csv_file";
+my $excel_file="$Common::base_dir/srdb/$srdb_num/$srdb_num.xls";
+#print Dumper(@rpt);
+$rpt_object->write_excel_file($excel_file,\@headers,\@rpt);
+say "Excel Report=>$excel_file";
+email if ($mail_to and @rpt);
+exit;
+##########################################################
+sub determine_gb_reclaim{
+##########################################################
+    #my $gb_reclaim=determine_gb_reclaim($gb_vol_reduce,$vol_capacity,$vol_delete,$qtree_delete,$sm_vol_destroy,$sm_qtree_delete);
+   my $gb_vol_reduce=shift;
+   my $vol_capacity=shift;
+   $vol_capacity=ceil $vol_capacity/1024; #input is in mb, convert to gb
+   my $vol_delete=shift;
+   my $qtree_delete=shift;
+   my $sm_vol_destroy=shift;
+   my $sm_qtree_delete=shift;
+   my $snap_capacity=shift;
+   $snap_capacity=ceil $snap_capacity/1024; #input is in mb, convert to gb
+   #say "\ngb_vol_reduce => $gb_vol_reduce";
+   #say "vol_capacity => $vol_capacity";
+   #say "vol_delete => $vol_delete";
+   #say "snap_capacity => $snap_capacity";
+   #exit;
+   if ($gb_vol_reduce =~ /ERR/i) {
+      return $gb_vol_reduce;
+   }
+   #if (($qtree_delete =~ /yes/)&&($sm_qtree_delete)){
+     #return $gb_vol_reduce * 2;
+   #}
+   if ($qtree_delete =~ /yes/){
+     return $gb_vol_reduce;
+   }
+   #if (($vol_delete =~ /yes/)&&($sm_vol_destroy)){
+     #return $vol_capacity * 2;
+   #}
+   if ($vol_delete =~ /yes/){
+     return $vol_capacity+$snap_capacity;
+   }
+  return 0; ##if got here, then must be just a path reclaim
+}
+##########################################################
+sub exports_cmds{
+##########################################################
+   my $comp=shift;
+   my @cmds;
+   my $filer=$reclaims{$comp}{real_filer};
+   unless ($exports_saved{$filer}){
+      push @backup_cmds,"echo -e \"\\nMaking backup copy of $filer exports\"";
+      my $string="echo \"cp -v /Netapp/all/$filer";
+      $string.="/etc/exports /Netapp/all/$filer";
+      $string.="/etc/exports.`date +%Y%m%d`.decomm\"";
+      push @backup_cmds,$string;
+      push @backup_cmds,"echo CR to continue;read garbage";
+      $string="cp -v /Netapp/all/$filer";
+      $string.="/etc/exports /Netapp/all/$filer";
+      $string.="/etc/exports.`date +%Y%m%d`.decomm";
+      push @backup_cmds,$string;
+      $exports_saved{$filer}=1;#this means we made a exports copy for filer
+   }
+   if (grep /qtree/,$reclaims{$comp}{nfs_exports}){
+      my $string="echo -e \"\\nRemove qtree export cmd->ssh $filer";
+       $string.=" exportfs -z -v $reclaims{$comp}{path}\"";
+       push @cmds,$string;undef $string;
+       $string="ssh $filer exportfs ";
+       $string.="-z -v $reclaims{$comp}{path}";
+       push @cmds,$string;
+       push @cmds,"echo CR to continue;read garbage";
+   }
+   if (grep /vol/,$reclaims{$comp}{nfs_exports}){
+       my $string="echo \"\\nRemoving vol export->ssh $filer";
+       $string.=" exportfs -z -v /vol/$reclaims{$comp}{vol}\"";
+       push @cmds,$string;undef $string;
+       push @cmds,"echo CR to continue;read garbage";
+       $string="ssh $filer exportfs ";
+       $string.="-z -v /vol/$reclaims{$comp}{vol}";
+       push @cmds,$string;
+       push @cmds,"echo CR to continue;read garbage";
+   }
+   return \@cmds;
+}
+##########################################################
+sub quota_cmds{
+##########################################################
+   my $comp=shift;
+   my @cmds;
+   my $filer=$reclaims{$comp}{real_filer};
+   unless ($quota_saved{$filer}){
+      push @backup_cmds,"echo -e \"\\nMaking backup copy of $filer quotas\"";
+      my $string="echo \"cp -v /Netapp/all/$filer";
+      $string.="/etc/quotas /Netapp/all/$filer";
+      $string.="/etc/quotas.`date +%Y%m%d`.decomm\"";
+      push @backup_cmds,$string;
+      push @backup_cmds,"echo CR to continue;read garbage";
+      $string="cp -v /Netapp/all/$filer";
+      $string.="/etc/quotas /Netapp/all/$filer";
+      $string.="/etc/quotas.`date +%Y%m%d`.decomm";
+      push @backup_cmds,$string;
+      $quota_saved{$filer}=1;#this means we made a quota copy for filer
+   }
+   my $string="echo -e \"\\nComment out lines starting with ";
+   $string.="$reclaims{$comp}{path} from ";
+   $string.="/Netapp/all/$filer/etc/quotas\"";
+   push @cmds,$string;
+   $string="echo \"Comment out cmd=> sed -i 's%^$reclaims{$comp}{path}%#$reclaims{$comp}{path}%gI' /Netapp/all/$filer/etc/quotas\"";
+   push @cmds,$string;
+   push @cmds,"echo CR to continue;read garbage";
+   $string="sed -i 's%^$reclaims{$comp}{path}%#$reclaims{$comp}{path}%gI' /Netapp/all/$filer/etc/quotas";
+   push @cmds,$string;
+   return \@cmds;
+}
+##########################################################
+sub undo_snapmirror_cmds{
+##########################################################
+   my $comp=shift;
+   my @cmds;
+   my $filer=$reclaims{$comp}{real_filer};
+   my $source_vol=$reclaims{$comp}{vol};
+   my $source_qtree=$reclaims{$comp}{qtree};
+   #my $source_qtree_uri="$filer:/vol/$source_vol/$source_qtree";
+   my $source_qtree_uri="/vol/$source_vol/$source_qtree";
+   #my $dests=$reclaims{$comp}{sm_destinations};
+   my @dests=(@{$reclaims{$comp}{vol_dests}},
+             @{$reclaims{$comp}{qtree_dests}});
+   my ($vol,$qtree);
+#say "###IN UNDO SNAPMIRROR###";
+
+#print "dests->";print Dumper(@dests);
+#print "vol_dests->";print Dumper(@{$reclaims{$comp}{vol_dests}});
+#print "qtree_dests->";print Dumper(@{$reclaims{$comp}{qtree_dests}});
+   foreach (@dests){
+#say "line=>$_";
+      my $vol_snap=grep !/\/vol\//i,$_;
+      #say "SPLITING=>$_ $vol_snap";
+      my ($dest_filer,$vol)=split /:/;
+      #say "dest_filer=>$dest_filer vol=>$vol";
+      unless ($snapmirror_saved{$dest_filer}){
+         push @backup_cmds,"echo -e \"\\nMaking backup copy of dest $dest_filer snapmirror.conf\"";
+         my $string="echo \"cp -v /Netapp/all/$dest_filer";
+         $string.="/etc/snapmirror.conf /Netapp/all/$dest_filer";
+         $string.="/etc/snapmirror.conf.`date +%Y%m%d`.decomm\"";
+         push @backup_cmds,$string;
+         push @backup_cmds,"echo CR to continue;read garbage";
+         $string="cp -v /Netapp/all/$dest_filer";
+         $string.="/etc/snapmirror.conf /Netapp/all/$dest_filer";
+         $string.="/etc/snapmirror.conf.`date +%Y%m%d`.decomm";
+         push @backup_cmds,$string;
+         $snapmirror_saved{$dest_filer}=1;#this means we made a copy for filer
+      } ##end saving snapmirror conf
+      my $string="echo -e \"\\nComment out lines for destination ";
+      $string.=" $_ from ";
+      $string.="/Netapp/all/$dest_filer/etc/snapmirror.conf\"";
+      push @cmds,$string;
+      $string="echo \"Comment out cmd=>sed -i '\\% $_ \%I s%^%#\%gI'";
+      $string.=" /Netapp/all/$dest_filer/etc/snapmirror.conf\"";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      $string="sed -i '\\% $_ \%I s%^%#\%gI'";
+      $string.=" /Netapp/all/$dest_filer/etc/snapmirror.conf";
+      push @cmds,$string;
+
+      $string="echo -e \"\\nSnapmirror quiesce cmd=>";
+      $string.="ssh $dest_filer snapmirror quiesce $_\"";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      $string="ssh $dest_filer snapmirror quiesce $_";
+      push @cmds,$string;
+
+      $string="echo -e \"\\nSnapmirror break cmd=>";
+      $string.="ssh $dest_filer snapmirror break -f $_\"";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      $string="ssh $dest_filer snapmirror break -f $_";
+      push @cmds,$string;
+
+      my $release=$vol;
+      if ($vol_snap){
+         $release=$source_vol;
+      } else {
+         $release=$source_qtree_uri;
+      }
+   
+      
+      $string="echo -e \"\\nSnapmirror release cmd=>";
+      $string.="ssh $filer snapmirror release $release $_\"";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      $string="ssh $filer snapmirror release $release $_";
+      push @cmds,$string;
+   }#end foreach @$dests
+   #say "###########SNAPMIRRORS###########################";
+   #say "$_ " foreach (@cmds);
+   #say "#################################################";
+   #say "###END UNDO SNAPMIRROR###";
+   return \@cmds;
+}
+##########################################################
+sub vol_snapmirror_cmds{
+##########################################################
+   my $comp=shift;
+   my @cmds;
+   my $filer=$reclaims{$comp}{real_filer};
+   my $dests=$reclaims{$comp}{vol_dests};
+   #lets check for qtree dests if no vol_dests
+   #unless (@$dests ){
+      #$dests=$reclaims{$comp}{qtree_dests};
+   #}
+
+   my ($vol,$qtree);
+   foreach (@$dests){
+      #say "vol dest=>$_";
+      ##we dont destroy the dest vol if the destination is a qsm
+      next if (/\/vol\//);
+      my ($dest_filer,$vol)=split /:/;
+      my $string="echo -e \"\\nOffline destination vol=>";
+      $string.="ssh $dest_filer vol offline $vol\"";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      $string="ssh $dest_filer vol offline $vol";
+      push @cmds,$string;
+
+      $string="echo -e \"\\nDestroy destination vol=>";
+      $string.="ssh $dest_filer vol destroy $vol -f\"";
+      push @email_notify,"Comp $comp-> vol destroy $dest_filer:/vol/$vol";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      $string="ssh $dest_filer vol destroy $vol -f";
+      push @cmds,$string;
+   }#end foreach @dests
+   return \@cmds;
+}
+##########################################################
+sub qtree_snapmirror_cmds{
+##########################################################
+   #say "in qtree_snapmirror_cmds";
+   my $comp=shift;
+   my @cmds;
+   my $filer=$reclaims{$comp}{real_filer};
+
+   my $dests=$reclaims{$comp}{qtree_dests};
+
+   my ($vol,$qtree);
+   foreach (@$dests){
+      my ($dest_filer,$dest_dest)=split /:/;
+      if ($dest_dest =~ /^\/vol\/(\S+)\/(\S+)$/) {
+          $vol=$1;$qtree=$2;
+          print "vol=>$vol qtree=>$qtree" if $verbose;
+      }
+      #test if this is last qtree dest vol
+      #/root/reclaim/chk_vol 0 return value means only the qtree remains
+      #print $?." value\n";
+      my $string="echo -e \"\\nchecking vol if last qtree=>/root/reclaim/chk_vol $dest_filer $vol $qtree\"";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      $string="if /root/reclaim/chk_vol $dest_filer $vol $qtree ; then";
+      push @cmds,$string;
+      $string="    echo 'DESTROY SNAPMIRROR VOL'";
+      push @cmds,$string;
+      $string="   echo -e \"\\nOffline destination vol=>";
+      $string.="ssh $dest_filer vol offline $vol\"";
+      push @cmds,$string;
+      push @cmds,"   echo CR to continue;read garbage";
+      $string="   ssh $dest_filer vol offline $vol";
+      push @cmds,$string;
+
+      $string="   echo -e \"\\nDestroy destination vol=>";
+      $string.="  ssh $dest_filer vol destroy $vol -f\"";
+      push @email_notify,"Comp $comp-> vol destroy $dest_filer:/vol/$vol";
+      push @cmds,$string;
+      push @cmds,"   echo CR to continue;read garbage";
+      $string="   ssh $dest_filer vol destroy $vol -f";
+      push @cmds,$string;
+      $string="else";
+      push @cmds,$string;
+      $string="    echo 'DO NOT DESTROY SNAP VOL'";
+      push @cmds,$string;
+      $string="   echo -e \"\\nDeleting destination qtree=>ssh $dest_filer \\\"priv";
+      $string.=" set advanced;qtree delete ";
+      $string.="-f " if $force;
+      $string.="/vol/$vol/$qtree\\\"\"";
+      push @email_notify,"Comp $comp-> qtree delete $dest_filer:/vol/$vol/$qtree";
+      push @cmds,$string;
+      push @cmds,"   echo CR to continue;read garbage";
+      $string="   ssh $dest_filer \"priv set advanced;qtree delete ";
+      $string.="-f " if $force;
+      $string.=" /vol/$vol/$qtree\"";
+      push @cmds,$string;
+      #say 'reclaims{comp}{vol_reduce}=>'.$reclaims{$comp}{vol_reduce};
+      if ($reclaims{$comp}{vol_reduce}=~ /^[\d+\.]$/){
+         my $reduce=floor($reclaims{$comp}{vol_reduce});
+         $string="   echo -e \"\\nReducing destination vol size=>ssh $dest_filer vol size ";
+         $string.="$vol -$reduce\"";
+         push @cmds,$string;
+         push @cmds,"   echo CR to continue;read garbage";
+         $string="   ssh $dest_filer vol size $vol -$reduce";
+         push @cmds,$string;
+      } #end if ($reclaims{$comp}{vol_reduce}=~ /^[\d+\.]$/){
+      $string="fi";
+      push @cmds,$string;
+
+   }#end foreach @dests
+
+   return \@cmds;
+}
+##########################################################
+sub qtree_del_cmds{
+##########################################################
+   my $comp=shift;
+   my @cmds;
+   my $filer=$reclaims{$comp}{real_filer};
+   my $string="echo -e \"\\nDeleting qtree=>ssh $filer \\\"priv";
+   $string.=" set advanced;qtree delete ";
+   $string.="-f " if $force;
+   $string.="/vol/$reclaims{$comp}{vol}/$reclaims{$comp}{qtree}\\\"\"";
+   push @cmds,$string;
+   push @cmds,"echo CR to continue;read garbage";
+   $string="ssh $filer \"priv set advanced;qtree delete ";
+   $string.="-f " if $force;
+   $string.="/vol/$reclaims{$comp}{vol}/$reclaims{$comp}{qtree}\"";
+   push @email_notify,"Comp $comp-> qtree delete $filer:/vol/$reclaims{$comp}{vol}/$reclaims{$comp}{qtree}";
+   push @cmds,$string;
+#say "vol_delete=>$reclaims{$comp}{vol_delete}";
+#say "vol_reduce=>$reclaims{$comp}{vol_reduce}";
+#say "gb_vol_reduce=>$reclaims{$comp}{gb_vol_reduce}";
+   if ($reclaims{$comp}{gb_vol_reduce} eq 'ERR'){
+      #say "gb_vol_reduce ERR";
+      $string="echo NOT reducing vol size because ERR detected";
+      push @cmds,$string;
+      $string.="echo while determining vol reduction amount";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      return \@cmds;
+   }
+   if (($reclaims{$comp}{vol_delete} ne 'yes')&&($reclaims{$comp}{vol_reduce}=~ /^[\d\.]+$/)){
+      say "REDUCE IT!";
+      my $reduce=floor($reclaims{$comp}{vol_reduce});
+      $string="echo -e \"\\nReducing vol size=>ssh $filer vol size ";
+      $string.="$reclaims{$comp}{vol} -$reduce\"";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      $string="ssh $filer vol size $reclaims{$comp}{vol} -$reduce";
+      push @cmds,$string;
+   }
+   return \@cmds;
+}
+##########################################################
+sub cifs_cmds{
+##########################################################
+   my $comp=shift;
+   my @cmds;
+   my $filer=$reclaims{$comp}{real_filer};
+   my @shares=split /\s+/,$reclaims{$comp}{cifs_share};
+   foreach my $share (@shares){
+      next if ($share =~ /^$/);
+      my $string="echo -e \"\\nDeleting cifs share->ssh ";
+      $string.="$filer cifs shares -delete $share\"";
+      push @cmds,$string;
+      push @cmds,"echo CR to continue;read garbage";
+      $string="ssh $filer cifs shares -delete $share";
+      push @cmds,$string;
+   }
+   return \@cmds;
+}
+##########################################################
+sub vol_del_cmds{
+##########################################################
+   my $comp=shift;
+   my @cmds;
+   my $filer=$reclaims{$comp}{real_filer};
+   my $vol=$reclaims{$comp}{vol};
+   my $qtree=$reclaims{$comp}{qtree};
+   my $string="echo -e \"\\nchecking vol if last qtree=>/root/reclaim/chk_vol $filer $vol $qtree\"";
+   push @cmds,$string;
+   push @cmds,"echo CR to continue;read garbage";
+   $string="if /root/reclaim/chk_vol $filer $vol $qtree ; then";
+   push @cmds,$string;
+   $string="    echo 'ONLY 1 QTREE REMAINS, DESTROY VOL'";
+   push @cmds,$string;
+   $string="else";
+   push @cmds,$string;
+   $string="    echo 'DO NOT DESTROY VOL'";
+   push @cmds,$string;
+   $string="    echo 'SOMETHING EXISTS IN VOL BESIDES TARGETED QTREE RECLAIM'";
+   push @cmds,$string;
+   $string="    echo 'ABORTING..'";
+   push @cmds,$string;
+   $string="    exit 1";
+   push @cmds,$string;
+   $string="fi";
+   push @cmds,$string;
+
+   $string="echo -e \"\\nOffline source vol=>";
+   $string.="ssh $filer vol offline $reclaims{$comp}{vol}\"";
+   push @cmds,$string;
+   push @cmds,"echo CR to continue;read garbage";
+   $string="ssh $filer vol offline $reclaims{$comp}{vol}";
+   push @cmds,$string;
+
+   $string="echo -e \"\\nDestroy source vol=>";
+   $string.="ssh $filer vol destroy $reclaims{$comp}{vol} -f\"";
+   push @cmds,$string;
+   push @cmds,"echo CR to continue;read garbage";
+   $string="ssh $filer vol destroy $reclaims{$comp}{vol} -f";
+   push @email_notify,"Comp $comp-> vol destroy $filer:/vol/$reclaims{$comp}{vol}";
+   push @cmds,$string;
+   return \@cmds;
+}
+##########################################################
+sub reclaim_cmds{
+##########################################################
+   #my ($srdb_num,$srdb_comp,$real_filer,$vol,$qtree,$path,$vol_reduce,$partner_filer,$partner_vol,$vol_delete,$qtree_delete,$path_delete,$nfs_exports,$cifs_share,$sm_destroy)=@_;
+    print "Making reclaim commands..";
+    foreach my $comp (sort keys %reclaims){
+       next if ($reclaims{$comp}{sm_target});
+       #say "comp=>$comp";
+       my @cmds;
+       my $string="echo ## $reclaims{$comp}{real_filer} ";
+       $string.=" $reclaims{$comp}{vol} $reclaims{$comp}{qtree}";
+       push @cmds,$string;undef $string;
+       if ($reclaims{$comp}{sm_vol_destroy}){
+          foreach my $dests (@{$reclaims{$comp}{'vol_dests'}}){
+             push @cmds,"echo ## snap vol destination $dests";
+             #say "echo ## snap vol destination $dests";
+          }
+       }
+       #say "sm_qtree_delete->".$reclaims{$comp}{sm_qtree_delete};
+       if (($reclaims{$comp}{sm_qtree_delete}) or 
+          ($reclaims{$comp}{sm_vol_destroy})) {
+          foreach my $dests (@{$reclaims{$comp}{'qtree_dests'}}){
+             push @cmds,"echo ## snap qtree destination $dests";
+             #say "echo ## snap qtree destination $dests";
+          }
+       }
+       push @cmds,"echo #######################################################";
+       my $reclaim_cmds;
+       unless ($reclaims{$comp}{nfs_exports} =~ /^\s+$/ ){
+          $reclaim_cmds=exports_cmds($comp); 
+          push @cmds,@$reclaim_cmds if $reclaim_cmds;undef $reclaim_cmds;
+       }
+       unless ($reclaims{$comp}{cifs_share} =~ /^\s+$/ ){
+          $reclaim_cmds=cifs_cmds($comp); 
+          push @cmds,@$reclaim_cmds if $reclaim_cmds;undef $reclaim_cmds;
+       }
+       $reclaim_cmds=quota_cmds($comp);
+       push @cmds,@$reclaim_cmds if $reclaim_cmds;undef $reclaim_cmds;
+########SNAPMIRRORS#################
+#say "sm_qtree_delete->".$reclaims{$comp}{sm_qtree_delete};
+#say "sm_vol_destroy->".$reclaims{$comp}{sm_vol_destroy};
+       if  (($reclaims{$comp}{sm_qtree_delete})or
+           ($reclaims{$comp}{sm_vol_destroy})){
+           $reclaim_cmds=undo_snapmirror_cmds($comp);
+           push @cmds,@$reclaim_cmds if $reclaim_cmds;undef $reclaim_cmds;
+       }
+       if  ($reclaims{$comp}{sm_qtree_delete}){
+          $reclaim_cmds=qtree_snapmirror_cmds($comp);
+          push @cmds,@$reclaim_cmds if $reclaim_cmds;undef $reclaim_cmds;
+       }
+       if  ($reclaims{$comp}{sm_vol_destroy}){
+          $reclaim_cmds=vol_snapmirror_cmds($comp);
+          push @cmds,@$reclaim_cmds if $reclaim_cmds;undef $reclaim_cmds;
+       }
+########END SNAPMIRRORS#################
+       if (($reclaims{$comp}{qtree_delete} eq 'yes')&&
+           ($reclaims{$comp}{vol_delete} ne 'yes')){
+           $reclaim_cmds=qtree_del_cmds($comp);
+           push @cmds,@$reclaim_cmds if $reclaim_cmds;undef $reclaim_cmds;
+       }
+       if ($reclaims{$comp}{vol_delete} eq 'yes'){
+           $reclaim_cmds=vol_del_cmds($comp);
+           push @cmds,@$reclaim_cmds if $reclaim_cmds;undef $reclaim_cmds;
+       }
+
+
+       my $cmds_file="$Common::base_dir/srdb/$srdb_num/$srdb_num.$comp";
+       open CMDS,">$cmds_file" or die "Unable to open $cmds_file\n $!";
+       print CMDS "$_\n" foreach (@cmds);
+       close CMDS;
+    }
+    my $backups_file="$Common::base_dir/srdb/$srdb_num/$srdb_num.backups";
+    open BKS,">$backups_file" or die "Unable to open $backups_file\n $!";
+    print BKS"$_\n" foreach (@backup_cmds);
+    close BKS;
+   
+    
+    say "done with reclaim_cmds"; 
+}
+##########################################################
+sub determine_vol_snap{
+##########################################################
+   print "determine_vol_snap...";
+   my $filer=shift;
+   my $vol=shift;
+   my $qtree=shift;
+   my $qtree_limit=shift;
+   my $vol_capacity=shift;
+   my $vol_used=shift;
+   my $vol_delete=shift;
+   my $vol_free=$vol_capacity-$vol_used;
+   my $snap_percent='NA';
+   my $vol_reduce='NA';
+
+   if (($vol eq 'NA')or($qtree eq 'NA')or($qtree_limit eq 'NA')){
+      print "$snap_percent $vol_reduce\n" if $verbose;
+      return $snap_percent,' ',$vol_reduce;
+   }  
+    my $cmd="ssh $filer snap reserve $vol"; 
+    print "determine_vol_snap cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_ssh $cmd;
+    if (@$stderr){
+        logit "STDOUT determine_vol_snap$_" foreach (@$stdout);
+        logit "STDERR determine_vol_snap $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return;
+    }
+    foreach (@$stdout){
+       if (/current snapshot reserve is (\S+)/){
+          $snap_percent=$1;
+          $snap_percent=~s/%//g;
+          my $calc_percent=sprintf '.%02d', $snap_percent;
+          #say "calc_percent=>$calc_percent";
+          unless ($qtree_limit eq '-'){
+             $vol_reduce=($qtree_limit+($qtree_limit * $calc_percent));
+          }
+       } 
+    }
+  my $gb_vol_reduce=0;
+  return "$snap_percent%",'NA','NA' if ($vol_delete eq 'yes');
+  ##gb_vol_reduce is only MB at first to compare with vol_cap , vol_free
+  unless ($vol_reduce eq 'NA'){
+     $gb_vol_reduce=$vol_reduce/1024 ;
+     ##check that the $gb_vol_reduce calculation is less
+     ##than the $vol_capacity and the $vol_free
+     #note, comparison is in MB.Changed to GB if passes check
+     say "gb_vol_reduce=>$gb_vol_reduce vol_capacity=>$vol_capacity";
+     if (($gb_vol_reduce > $vol_capacity)||($gb_vol_reduce > $vol_free)){
+        my $txt="qtree tree vol reduction size greater then vol capacity or vol free";
+        say $txt if $verbose;
+        push @warn_rpt,["$filer:/vol/$vol/$qtree",$txt];
+        $gb_vol_reduce='ERR';
+     } else {
+        $gb_vol_reduce=$gb_vol_reduce/1024;
+     }
+  }#end unless $vol_reduce eq NA
+  say "$snap_percent% $vol_reduce $gb_vol_reduce" if $verbose;
+  return "$snap_percent%",$vol_reduce,$gb_vol_reduce;
+}
+##########################################################
+sub determine_uri{
+##########################################################
+#my ($srdb_comp,$uri,$orig_filer,$remains)=determine_uri($_);
+    my $inline=shift;
+    print "determine uri..."; 
+    my $srdb_comp='NA';
+    my $field_count=count_fields($inline);
+    if ($field_count > 2 ){
+       push @warn_rpt,[$inline,"WARN:More then 2 fields detected,skipping"];
+       logit "WARN:More then 2 fields detected, skipping $inline";
+       return undef;
+    }
+    if ($field_count < 2 ){
+       push @warn_rpt,[$inline,"WARN:Less then 2 fields detected,skipping"];
+       logit "WARN:Less then 2 fields detected, skipping $inline";
+       return undef;
+    }
+    my $comp=my $uri =' ';
+    if ($field_count == 2){
+       ($srdb_comp,$uri)=split /\s+/;
+    #}else{ 
+       #$uri=$_;
+       #$srdb_comp=$srdb_num;
+    }
+    my ($cifs_type,$nfs_type);
+    if ($uri =~ /\\/) {
+       $cifs_type=1;
+       logit "CIFS URI type..." if $debug;
+    } elsif ($uri =~ /\//) {
+       $nfs_type=1;
+       logit "NFS URI type..." if $debug;
+    } else { 
+       push @warn_rpt,[$inline,'WARN:CIFS or NFS style URI not specified.'];
+       logit 'WARN:CIFS or NFS style URI not specified in input line.';
+       logit "WARN:Skipping $inline";
+       return undef;
+    }
+    my ($discard2,$orig_filer,$remains);
+    ($orig_filer,$remains)=split /:/,$uri if $nfs_type;
+    if ($cifs_type) {
+       if ( $uri=~ /^\\\\(\S+)\\(\S+)/){
+          $orig_filer=$1;
+          $remains=$2;
+       } 
+    }
+    unless ($orig_filer and $remains){
+       push @warn_rpt,[$inline,"WARN:unable to determine filer name or remaining URI"];
+       logit "WARN:unable to determine filer name or remaining URI, skipping $inline";
+       return undef;
+    }
+    print "$srdb_comp $orig_filer $remains\n" if $verbose;
+    logit "srdb_comp=>$srdb_comp uri=>$uri orig_filer=>$orig_filer remains=$remains";
+    return($srdb_comp,$uri,$orig_filer,$remains);
+}
+##########################################################
+sub determine_vol_qtree{
+##########################################################
+   my $filer=shift;
+   my $remains=shift;
+   my $vol="NA";
+   my $qtree="NA";
+   my $path="NA";
+   print "determine vol qtree...";
+   #say "\nin determine_vol_qtree remains=>$remains"; exit;
+   if ($remains =~ /^\/vol\/(\S+)\/(\S+)\/.*/i) {
+       #NFS path goes beyond qtree
+       $vol=$1;$qtree=$2;$path=$remains;
+       print "vol=>$vol qtree=>$qtree path=$path\n" if $verbose;
+       return $vol,$qtree,$path;
+   }
+   if ($remains =~ /^\/vol\/(\S+)\/(\S+).*/i) {
+       #NFS path ends with qtree
+       $vol=$1;$qtree=$2;$path=$remains;
+       print "vol=>$vol qtree=>$qtree path=$path\n" if $verbose;
+       return $vol,$qtree,$path;
+   }
+   if ($remains =~ /^(\S+).*/i) {
+       my $SHARE=$1;
+       #say "Cifs, need to find vol/qtree for $SHARE";
+       my $cmd="ssh $filer cifs shares $SHARE"; 
+       print "detemine_vol_qtree CIFS cmd => $cmd\n" if $debug;
+       my ($stdout,$stderr)=run_ssh $cmd;
+       if (@$stderr){
+           logit "ERROR STDOUT detemine_vol_qtree:$filer $remains:$_" foreach (@$stdout);
+           logit "ERROR STDERR determine_vol_qtree:$filer $remains:$_" foreach (@$stderr);
+           push @warn_rpt,["$filer $remains","STDERR $_"] foreach (@$stderr);
+           return undef;
+       }
+       $SHARE=~s/\$/\\\$/gi ;
+       foreach (@$stdout){
+          if (/^$SHARE\s+\/vol\/(\w+)\/(\w+)/i){
+             $vol=$1;$qtree=$2;
+             if (/^$SHARE\s+(\S+)\s+/i){
+                $path=$1;
+             }
+             print "vol=>$vol qtree=>$qtree path=$path\n" if $verbose;
+             return $vol,$qtree,$path;
+          }
+       }#end for each @$stdout
+       print "vol=>$vol qtree=>$qtree path=>$path" if $debug;
+       return ($vol,$qtree,$path);
+    }#end if $uri 
+} #end sub
+##########################################################
+sub qtree_status{
+##########################################################
+    print "qtree_status..." if $verbose;
+    my $filer=$_[0];
+    my $vol=$_[1];
+    my $qtree=$_[2];
+    if ($qtree eq 'NA'){
+       print "vol delete no\n" if $verbose;
+       return ' '; 
+    }
+    #return 'no' if ($qtree eq 'NA');
+    print "\n" if $debug;
+    my $array_cnt=0;
+    foreach my $qtree_array (@{$filer_vol_qtrees{$filer}{$vol}}){
+         print "qtree_status->checking $filer $vol qtree->$qtree_array\n" if $debug;
+         if ($qtree eq $qtree_array){
+             print "qtree_status->setting $filer $vol $qtree to NA\n" if $debug;
+             ${$filer_vol_qtrees{$filer}{$vol}}[$array_cnt]="NA";
+         }
+         $array_cnt++;
+    }
+    foreach my $qtree_array (@{$filer_vol_qtrees{$filer}{$vol}}){
+         #print "$filer $vol qtree->$qtree_array\n" if $debug;
+         print "$vol/$qtree_array=>vol delete no\n" if $debug;
+         return ' ' if ($qtree_array ne "NA");
+    }
+    ##If we exited the above loop, then all qtrees are NA(set to be deleted)
+    print 'vol delete yes\n' if $verbose;
+    return 'yes';
+}
+##########################################################
+sub load_qtree_hash{
+##########################################################
+#We also create quota file here
+    my $filer=$_[0];
+    my $cmd="ssh $filer qtree status"; 
+    print "qtree_status cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_ssh $cmd;
+    if (@$stderr){
+        logit "ERROR STDOUT load_qtree_hash $_" foreach (@$stdout);
+        logit "ERROR STDERR load_qtree_hash $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return;
+    }
+    print "loading $filer qtrees." if $verbose;
+    open QTREE,">$Common::base_dir/srdb/$srdb_num/$filer.qtree";
+    foreach (@$stdout){
+       print QTREE "$_\n";
+       next if /^$/;
+       next if /^Volume /;
+       next if /^--/;
+       #print "$_\n";
+       print "." if $verbose;
+       my ($Volume,$Tree,$Style,$Oplocks,$Status);
+       if (/^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)?/) {
+           $Volume=$1||"NA";
+           $Tree=$2||"NA";
+           $Style=$3||"NA";
+           $Oplocks=$4;
+           $Status=$5||"NA";
+           if ($Status eq "NA"){
+              $Status=$Oplocks;
+              $Oplocks=$Style;
+              $Style=$Tree;
+              $Tree="NA";
+           }
+       }
+       say $_ if ($debug);
+       print "\n$filer qtree status Volume=>$Volume\n" if $debug;
+       print "$filer qtree status Tree=>$Tree\n" if $debug;
+       print "$filer qtree status Style=>$Style\n" if $debug;
+       print "$filer qtree status Oplocks=>$Oplocks\n" if $debug;
+       print "$filer qtree status Status=>$Status\n" if $debug;
+       push (@{ $filer_vol_qtrees{$filer}{$Volume} },$Tree);
+    } #end foreach (@$stdout)
+    print "done\n";
+    close QTREE;
+    if ($debug){
+        foreach my $vol_key (keys %{$filer_vol_qtrees{$filer}}){
+           print "qtree vol key=>$vol_key ";
+           print "$_ " foreach ( @{$filer_vol_qtrees{$filer}{$vol_key}} );
+           print "\n";
+        } #end foreach $vol_key
+    } #end if $debug
+} #end load_qtree_hash
+##########################################################
+sub quota_report{
+##########################################################
+    my $qvol=$_[1];
+    my $qqtree=$_[2];
+    my $quota_use="NA";
+    my $quota_limit="NA";
+    my $quota_files="NA";
+    print "quota_report...";
+    #my $cmd="ssh $_[0] quota report|grep \"/vol/$qvol/$qqtree\$\"";
+    my $cmd="ssh $_[0] quota report|grep -P \" $qvol\\s+$qqtree \"";
+    print "quota report cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_ssh $cmd;
+    if (@$stderr){
+        logit "ERROR STDOUT quota report $_" foreach (@$stdout);
+        logit "ERROR STDERR quota report $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return $quota_use,$quota_limit,$quota_files;
+    }
+    foreach (@$stdout){
+       #print "QUOTA OUT=>$_\n";
+       #my @line=split / /,$_;
+       #if (/^\w+\s+\w+\s+\w+\s+\w+\s+(\w+)\s+(\w+)\s(\w+)/){
+       if (/^\S+\s+\S+\s+\S+\s+\S+\s+(\w+|-)\s+(\w+|-)\s+(\w+|-)\s+/){
+           $quota_use=$1;
+           $quota_limit=$2;
+           $quota_files=$3;
+       }
+       print "quota_use=>$quota_use quota_limit=>$quota_limit quota_files=>$quota_files\n" if $debug;
+    }
+    print "$quota_use $quota_limit $quota_files\n" if $verbose; 
+    return($quota_use,$quota_limit,$quota_files);
+    
+}
+##########################################################
+sub exports{
+##########################################################
+    print "exports..."; 
+    my $evol=$_[1];
+    my $eqtree=$_[2];
+    my $vol_delete=$_[3];
+    my $exports_vol=" ";
+    my $exports_qtree=" ";
+    my $cmd="ssh $_[0] exportfs -q /vol/$evol";
+    #say "evol=>$evol eqtree=>$eqtree";
+    print "exports vol cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_ssh $cmd;
+    if (@$stderr){
+        logit "ERROR STDOUT exports vol $_" foreach (@$stdout);
+        logit "ERROR STDERR exports vol $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return $exports_vol,$exports_qtree;
+    }
+    foreach (@$stdout){
+       $exports_vol="vol" if ((/^\/vol\/$evol\s/)and ($vol_delete eq 'yes'));
+    }
+    $cmd="ssh $_[0] exportfs -q $eqtree";
+    print "exports qtree cmd => $cmd\n" if $debug;
+    ($stdout,$stderr)=run_ssh $cmd;
+    if (@$stderr){
+        logit "ERROR STDOUT exports vol $_" foreach (@$stdout);
+        logit "ERROR STDERR exports vol $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return $exports_vol,$exports_qtree;
+    }
+    print "exports_vol=>$evol\nexports_qtree=>$eqtree\n" if $verbose;
+    foreach (@$stdout){
+       $exports_qtree="qtree" if (/^$eqtree\s+/);
+    }
+    print "$exports_vol $exports_qtree\n" if $verbose; 
+    return ' ' if (($exports_vol eq ' ')and($exports_qtree eq ' '));
+    return("$exports_qtree $exports_vol");
+    
+}
+##########################################################
+sub cifs_shares{
+##########################################################
+    print "cifs..."; 
+    my $cvol=$_[1];
+    my $cqtree=$_[2];
+    my $uri=$_[3];
+    my $vol_delete=$_[4];
+    my $path=$_[5];
+    my $qtree_delete=$_[6];
+    my $cifs_vol_share=" ";
+    my $cifs_qtree_share=" ";
+    my $cifs_path_share=" ";
+    my $cmd="ssh $_[0] cifs shares";
+    print "cifs_shares cmd => $cmd\n" if $debug;
+    my ($stdout,$stderr)=run_ssh $cmd;
+    if (@$stderr){
+        logit "ERROR STDOUT cifs_shares $_" foreach (@$stdout);
+        logit "ERROR STDERR cifs shares $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef;
+    }
+    
+    print "searching cifs for vol=>$cvol qtree=>$cqtree path=>$path\n" if $debug;
+    foreach (@$stdout){
+       next if (/^\s/);
+       say "considering=>$_" if $debug;
+       if ((/^([\S\$]+)\s+\/vol\/$cvol\s/)&&($vol_delete eq "yes")){
+          #$cifs_vol_share="vol";
+          $cifs_vol_share=$1;
+          print "cifs_vol_share=>$cifs_vol_share\n" if $debug;
+          next;
+       }
+       if ((/^([\S\$]+)\s+\/vol\/$cvol\/$cqtree(\s|$)/)&&($qtree_delete eq 'yes')){
+          #$cifs_qtree_share="qtree";
+          $cifs_qtree_share=$1;
+          print "cifs_qtree_share=>$cifs_qtree_share\n" if $debug;
+          next;
+       }
+       if (/^([\S\$]+)\s+$path(\s|$)/){
+          #$cifs_path_share="path";
+          $cifs_path_share=$1;
+          print "cifs_path_share=>$cifs_path_share\n" if $debug;
+          next;
+       }
+    }
+    print "search over... cifs for vol=>$cvol qtree=>$cqtree \n" if $debug;
+    print "$cifs_vol_share $cifs_qtree_share $cifs_path_share" if $verbose; 
+    return ("$cifs_vol_share $cifs_qtree_share $cifs_path_share");
+}
+##########################################################
+sub verify_vol_qtree{
+##########################################################
+    print "verify_vol_qtree..."; 
+    my $filer=$_[0];
+    my $vol=$_[1];
+    my $qtree=$_[2];
+    my $found_vol="NA";
+    my $found_qtree="NA";
+    
+    print "searching for vol=>$vol qtree=>$qtree\n" if $debug;
+    foreach my $qtree_array (@{$filer_vol_qtrees{$filer}{$vol}}){
+         $found_vol=$vol;
+         print "verify_vol_qtree->checking $filer $vol $qtree with $qtree_array\n" if $debug;
+         if ($qtree eq $qtree_array){
+             print "verify_vol_qtree->match found $filer $vol $qtree\n" if $debug;
+             $found_qtree=$qtree;
+             last;
+         }
+    }
+    #foreach my $qtree_array (@{$filer_vol_qtrees{$filer}{$vol}}){
+         #print "$filer $vol qtree->$qtree_array\n" if $debug;
+         #print "vol delete no\n" if $verbose;
+         #return "no" if ($qtree_array ne "NA");
+    #}
+    say "found_vol $found_vol found_qtree $found_qtree" if $verbose;
+    #if (($found_vol eq 'NA') or ($found_qtree eq 'NA')){
+       #push
+    #}
+    return ($found_vol,$found_qtree);
+}
+##########################################################
+sub get_df{
+##########################################################
+    my $cmd="ssh $_[0] df -m $_[1]";
+    print "df..."; 
+    print "get_df cmd => $cmd\n" if $debug;
+    my $capacity="NA";
+    my $used="NA";
+    my $snap_capacity="NA";
+    my ($stdout,$stderr)=run_ssh $cmd;
+    if (@$stderr){
+        logit "ERROR STDOUT get_df $_" foreach (@$stdout);
+        logit "ERROR STDERR get_df $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return $capacity,$used;
+    }
+    foreach (@$stdout){
+        #say $_;
+        if (/^\/vol\/$_[1]\/\s+(\S+)\s+(\S+)/) {
+            $capacity=$1;
+            $used=$2;
+        }
+        if (/^\/vol\/$_[1]\/.snapshot\s+(\S+)\s+\S+/) {
+            $snap_capacity=$1;
+        }
+    }
+    $capacity =~ s/MB//g;
+    $used =~ s/MB//g;
+    $snap_capacity =~ s/MB//g;
+    print "capacity=>$capacity used=>$used snap_capacity=>$snap_capacity" if $verbose;
+    return ($capacity,$used,$snap_capacity);
+}
+##########################################################
+sub snapmirror{
+##########################################################
+    print "snapmirror..."; 
+    my $filer=shift;
+    my $vol=shift;
+    my $qtree=shift;
+    my (@qtree_dests,@vol_dests,@qtree_sources,@vol_sources);
+    my $cmd="ssh $filer snapmirror status";
+    my ($stdout,$stderr)=run_ssh $cmd;
+    if (@$stderr){
+        logit "ERROR STDOUT snapmirror $_" foreach (@$stdout);
+        logit "ERROR STDERR snapmirror $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef;
+    }
+    foreach (@$stdout){
+       #print "$_\n";
+       if (/^$filer:\/vol\/$vol\/$qtree\s+(\S+)/){
+          say "Qtree snapmirror dest $1"  if $verbose;
+          my ($qdest_filer,$qleft)=split /:/,$1;
+          if (mirror_state("$filer:/vol/$vol/$qtree",$qdest_filer,$1)){
+              push @qtree_dests,$1;
+          }
+          next;
+       }
+       if (/^$filer:$vol\s+(\S+)/){
+          say "Vol snapmirror dest $1" if $verbose;
+          my ($dest_filer,$left)=split /:/,$1;
+          say " dest filer>$dest_filer dest->$1" if $verbose;
+          if (mirror_state("$filer:$vol",$dest_filer,$1)){
+             push @vol_dests,$1; 
+          }
+       }
+       if (/^(\S+:\S+)\s+$filer:$vol\s+Snapmirrored/){
+          say "Vol snapmirror source $1" if $verbose;
+          push @vol_sources,$1;
+       }
+       if (/^(\S+:\S+)\s+$filer:\/vol\/$vol\/$qtree\s+Snapmirrored/){
+          say "Qtree snapmirror source $1" if $verbose;
+          push @qtree_sources,$1;
+       }
+    }#end foreach @$stdout
+    #if ($verbose){ print "$_ " foreach (@vol_dests);}
+    #if ($verbose){ print "$_ " foreach (@qtree_dests);}
+    #if ($verbose){ print "$_ " foreach (@vol_sources);}
+    return (\@vol_dests,\@qtree_dests,\@vol_sources,\@qtree_sources);
+}
+##########################################################
+sub mirror_state{
+##########################################################
+   my $source=shift;
+   my $dest_filer=shift;
+   my $dest=shift;
+   my $cmd="ssh $dest_filer snapmirror status $dest";
+   my ($nstdout,$nstderr)=run_ssh $cmd;
+   if (@$nstderr){
+      logit "ERROR STDOUT snapmirror $_" foreach (@$nstdout);
+      logit "ERROR STDERR snapmirror $_" foreach (@$nstderr);
+      push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$nstderr);
+      return undef;
+   }
+   #print "\nsearching for $dest\n";
+   foreach my $dest_line (@$nstdout){
+      #print "$dest_line\n" ;
+      if ($dest_line=~/.+$dest\s+(\S+)/){
+         print "dest $dest state->$1\n" if ($1 and $verbose);
+         unless ($1 eq 'Snapmirrored'){
+             push @warn_rpt,["snapmirror $source $dest","Broken-off"];
+             return undef;
+         }#unless $state
+      }#if $dest_line
+   }#foreach my @dest_line
+   return 1;
+}
+##########################################################
+sub real_filer_name{
+##########################################################
+    print "real filer..."; 
+    my $cmd="ssh @_ hostname";
+    my ($stdout,$stderr)=run_ssh $cmd;
+    if (@$stderr){
+        logit "ERROR STDOUT real_filer_name $_" foreach (@$stdout);
+        logit "ERROR STDERR real_filer_name $_" foreach (@$stderr);
+        push @warn_rpt,[$cmd,"STDERR $_"] foreach (@$stderr);
+        return undef if (@$stderr);
+    }
+    my $real_name=$$stdout[0];
+    print "$real_name\n" if $verbose;
+    return $real_name;
+}
+##########################################################
+sub run_ssh{
+##########################################################
+   my $cmd = "@_";
+   print "run_ssh cmd $cmd\n" if $debug;
+   $|++;
+   my $errlog="/dev/shm/discover-srdb.errlog.$$";
+   my $outlog="/dev/shm/discover-srdb.log.$$";
+   open(ERRLOG, ">$errlog") or die "Can't open error log! $!";
+   open(OUTPUT, ">$outlog") or die "Can't open output log! $!";
+   my ($infh,$outfh,$errfh); # these are the FHs for our child 
+   $errfh = gensym(); # we create a symbol for the errfh 
+                   # because open3 will not do that for us 
+   my $pid;
+   eval{
+     $pid = open3($infh, $outfh, $errfh, $cmd);
+   };
+   die "open3: $@\n" if $@;
+   print "PID was $pid\n" if $debug;
+
+   my $sel = new IO::Select; # create a select object to notify
+                          # us on reads on our FHs
+   $sel->add($outfh,$errfh); # add the FHs we're interested in
+
+   while(my @ready = $sel->can_read) { # read ready
+       foreach my $fh (@ready) { 
+           my $line = <$fh>; # read one line from this fh
+           if(not defined $line){ # EOF on this FH
+               $sel->remove($fh); # remove it from the list
+               next;              # and go handle the next FH
+           }
+           if($fh == $outfh) {     # if we read from the outfh
+               print OUTPUT $line; # print it to OUTFH
+           } elsif($fh == $errfh) {# do the same for errfh  
+               print ERRLOG $line;
+           } else { # we read from something else?!?!
+               die "Shouldn't be here\n";
+           }
+       } #end foreach my $fh
+    } #end (while my @ready
+    close(ERRLOG) or warn "Can't close filehandle! $!";
+    close(OUTPUT) or warn "Can't close filehandle! $!";
+    open(ERRLOG, "$errlog") or die "Can't open error log! $!";
+    open(OUTPUT, "$outlog") or die "Can't open output log! $!";
+    my @out=(<OUTPUT>);
+    my @err=(<ERRLOG>);
+    close(ERRLOG) or die "Can't close filehandle! $!";
+    close(OUTPUT) or die "Can't close filehandle! $!";
+    chomp @out;
+    chomp @err;
+    if ($debug){
+        print "out=> $_\n" foreach (@out);
+        print "err=> $_\n" foreach (@err);
+    }
+    unlink $errlog or warn "Could not unlink $errlog: $!";
+    unlink $outlog or warn "Could not unlink $outlog: $!";
+    return (\@out,\@err);
+}
+##########################################################
+sub count_fields{
+##########################################################
+# Count and return the number of fields in a string.
+# The fields delimiter to be white space.
+    my $string=shift; 
+    no warnings;
+    my $count= scalar split /\s+/,$string;
+    return $count;
+}
+##########################################################
+sub error_msg{
+##########################################################
+      print "In error msg:\n" if $debug;
+      print "@_\n";
+      open (ERR_FILE,">>srdb/$srdb_num/$srdb_num.errors.log")
+           or die "Unable to open srdb/$srdb_num/$srdb_num.errors.log";
+      print ERR_FILE "@_\n";
+      close ERR_FILE;
+}
+##########################################################
+sub duplicate_check{
+##########################################################
+   my $real_filer=shift;
+   my $vol=shift;
+   my $qtree=shift or warn "qtree not passwd to duplicate_check $!";
+   foreach my $aref (@rpt){
+     foreach (@$aref){
+       if (($$aref[1] eq $real_filer )&&($$aref[2]eq $vol)&&($$aref[3] eq $qtree)){
+          return 1; ##duplicate found
+       }
+     }
+   } 
+   return 0; #duplicate not found
+}
+##########################################################
+sub handle_warnings{
+##########################################################
+   say "####################$srdb_num WARNINGS##############################";
+   open WARN_FILE,">$Common::base_dir/srdb/$srdb_num/$srdb_num.errors.log" or die "Unable to open WARN_FILE $!";
+   foreach my $aref (@warn_rpt){
+      foreach (@$aref){
+         say $_;
+         print WARN_FILE "$_\n";
+      }
+   }
+   close WARN_FILE;
+}
+##########################################################
+sub email{
+##########################################################
+    say "sending email to $mail_to";
+    my @headers=($col_head,'comp','NAS URI','Real Filer','Volume','Qtree','GB to Reclaim','Quota Files',,'Vol delete','Qtree delete','Path delete','SM Vol delete','SM Qtree delete');
+    foreach my $aref (@rpt){
+       my $comp=$$aref[1];
+       my $srdb_url="http://storagereqs.bankofamerica.com/EditComponent.aspx?New=NO&Request_ID=$srdb_num&Comp_ID=$comp";
+       $srdb_url=$srdb_num if $nexus;
+       $srdb_url="<a href=$srdb_url>$comp</s>";
+       $srdb_url="$srdb_num $comp" if $nexus;
+       push @email_rpt,[$$aref[0],$srdb_url,$$aref[2],$$aref[3],$$aref[4],$$aref[5],$$aref[15],$$aref[12],$$aref[16],$$aref[17],$$aref[18],$$aref[19],$$aref[20]];
+    } #end foreach $aref
+    #push @rpt,[$srdb_num,$srdb_comp,$uri,$real_filer,$vol,$qtree,$path,$vol_capacity,$vol_used,$snap_percent,$quota_limit,$quota_use,$quota_files,$vol_reduce,$gb_vol_reduce,$gb_reclaim,$vol_delete,$qtree_delete,$path_delete,$sm_vol_destroy,$sm_qtree_delete,$nfs_exports,$cifs_share,$nfs_destination,$cifs_destination];
+
+
+    my $srdb_link="http://storagereqs.bankofamerica.com/Request.aspx?ID=$srdb_num";
+       $srdb_link="http://warr.bankofamerica.com/ServiceRequest/ServiceRequestView.aspx?ServiceRequestID=$srdb_num" if $nexus;
+    my $srdb_link_text="<a href=$srdb_link>Srdb $srdb_num</s>";
+    $srdb_link_text="<a href=$srdb_link>Nexus $srdb_num</s>" if $nexus;
+    my @email_headers;
+    $rpt_object->email_to($mail_to);
+    $rpt_object->email_subject("$col_head $srdb_num reclaim analysis");
+    $rpt_object->MakeEmailBodyHeaders("$srdb_link_text reclaim",'',\@email_headers);
+    $rpt_object->MakeEmailBody(\@headers,\@email_rpt);
+    $rpt_object->email_attachment($excel_file);
+    $rpt_object->email_attachment($input_file);
+    if (@warn_rpt){
+       my @status_rpt='Warnings detected ';
+       $rpt_object->MakeEmailStatusHeaders('Red',\@status_rpt);
+       my @warn_headers=('data item','Warning message');
+       $rpt_object->MakeEmailBody(\@warn_headers,\@warn_rpt);
+    }
+    $rpt_object->SendEmail;
+    my $html_file="$Common::base_dir/srdb/$srdb_num/$srdb_num.html";
+    open (FH,">$html_file") or die "Unable to write $html_file $1";
+    print FH $rpt_object->email;
+    close FH;
+    say "HTML Report=>$html_file";
+} #end email
+##########################################################
+sub archive_srdb{
+##########################################################
+   my $srdbdir="$Common::base_dir/srdb/$srdb_num";
+   return 1 unless ( -d $srdbdir);
+   logit "INFO Archiving $srdbdir";
+   my $archive_cnt=1;
+   while (! mkdir "$srdbdir/archive$archive_cnt"){
+      $archive_cnt++;
+   }
+   say "archive_cnt=>$archive_cnt"; 
+   opendir (my $DIR, $srdbdir) or die "Unable to open dir $srdbdir$!\n";
+   while (my $file = readdir $DIR){
+      #say "$srdbdir/$file";
+      say "moving $srdbdir/$file,$srdbdir/archive$archive_cnt";
+      move ("$srdbdir/$file","$srdbdir/archive$archive_cnt");
+   }
+   closedir $DIR;
+   copy("$srdbdir/archive$archive_cnt/$srdb_num.info",$srdbdir);
+   logit "INFO archive to $srdbdir/archive$archive_cnt";
+}
+##########################################################
+sub sanity_check{
+##########################################################
+   unless ( -d "$Common::base_dir/srdb") {
+      mkdir "$Common::base_dir/srdb" or die 
+            "unable to mkdir $Common::base_dir/srdb $!";
+   }
+   if ( -f "$Common::base_dir/$srdb_num.info") {
+      unless ( -d "$Common::base_dir/srdb/$srdb_num") {
+         mkdir "$Common::base_dir/srdb/$srdb_num" or die 
+            "unable to mkdir $Common::base_dir/srdb/$srdb_num $!";
+      }
+      say "moving $Common::base_dir/$srdb_num.info to srdb/$srdb_num";
+      system("/bin/mv -f $Common::base_dir/$srdb_num.info srdb/$srdb_num");
+   }
+   unless ( -f "$input_file") {
+      print "$srdb_num.info not found in . or\n";
+      print "$Common::base_dir/srdb/$srdb_num, aborting\n";
+      exit 3;
+   }
+   #unlink "$Common::base_dir/srdb/$srdb_num/$srdb_num.errors.log" if ( -f "$Common::base_dir/srdb/$srdb_num/$srdb_num.errors.log");
+   #unlink "$Common::base_dir/srdb/$srdb_num/$srdb_num.log" if ( -f "$Common::base_dir/srdb/$srdb_num/$srdb_num.log");
+}
+##########################################################
+sub usage{
+##########################################################
+       print "Usage: discover-srdb -s|n <xxx> [-d] [-f] [-m <xxx>] [-v]\n";
+       print "             -s or -n is required\n";
+       print "       Where -s <xxx> = a srdb number.\n";
+       print "       Where -n <xxx> = a Nexus number.\n";
+       print "       Where -m <xxx> = mail to <xxx>, optional.\n";
+       print "       Where -v = verbose,optional.\n";
+       print "       Where -d = debug,optional.\n";
+       print "       Where -f = force qtree delete.\n";
+       print "       Where -f = force qtree delete.\n";
+       print "\n";       
+       print "        A input file named <xxxx>.info is required\n";
+       print "       in same directory where the script is  run.\n";
+       print "       Alternately, the input file may be placed into\n";
+       print "       a directory named with the srdb number \n";
+       print "       underneath the existing srdb directory.\n";       
+       print "\n";       
+       print "       Example: ./999999.info\n";       
+       print "       Alternate Example: srdb/999999/999999.info.\n";       
+       print "\n";       
+       print "       Requirements of the <xxxx.info> per line:\n";       
+       print "       filer:/vol/<vol>/<qtree>\n";       
+       print "\n";
+       print "       Alternate with <xxxx.info> per line\n";
+       print "       comp# filer:/vol/<vol>/<qtree>\n";       
+       print "\n";
+       print "       At this time, only Netapp platform supported.\n";
+       exit 1;
+}
+##########################################################
